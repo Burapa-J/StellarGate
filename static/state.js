@@ -93,6 +93,10 @@ export function initialState() {
     key: null,
     status: "",
     search: "",
+    /** Asset code filter ("" = all assets). */
+    asset: "",
+    /** Asset codes seen on loaded payments, for the asset dropdown. */
+    knownAssets: [],
     pageSize: 25,
     createdAfter: "",
     createdBefore: "",
@@ -214,7 +218,9 @@ export function createStore(seed) {
 
   /** The rows currently on screen: loaded rows narrowed by the search box. */
   function visiblePayments() {
-    return filterPayments(state.loadedPayments, state.search);
+    var rows = filterPayments(state.loadedPayments, state.search);
+    if (!state.asset) return rows;
+    return rows.filter(function (p) { return (p.asset || "XLM") === state.asset; });
   }
 
   /**

@@ -202,6 +202,20 @@ deploy. Sign in with any merchant API key.
 | Webhook deliveries | Every attempt for a payment, with a one-click **Redeliver** |
 | Health | Live `/ready` indicator, polled every 30s |
 
+**Filters.** Status chips, an asset dropdown (filled from the assets your
+payments use), a date range and a search box combine freely. A **Clear
+filters** button appears only while a filter is active and resets the state,
+the URL hash and the inputs in one click. Changing a filter resets pagination.
+
+**Deep links.** `/dashboard#payment=<id>` opens that payment's detail drawer
+on load; the hash follows the drawer open/close, and an unknown id shows the
+drawer's error state. Only filters and payment ids go in the hash. The API key
+never appears in a URL.
+
+**Modules.** `dashboard.js` is the controller, `state.js` the view-state store
+and hash serialisation, `format.js` the pure formatting and query helpers,
+`dashboard-theme.js` the theme toggle. Screenshots: see the PR description.
+
 The detail panel is a modal `<dialog>`: opened with `showModal()`, so the rest
 of the page is inert rather than merely covered, and it is a keyboard trap
 while open — it takes focus when it opens, `Tab` and `Shift+Tab` cycle inside
