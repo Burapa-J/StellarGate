@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Test `unwrap()` calls in `src/db.rs` and `src/config.rs` now use descriptive `expect()` messages (#554-#557).**
+  Test failures now name the operation that failed, so they are easier to
+  diagnose from CI logs. Test-only change.
+
 - **Legacy processed-stroop tests now include descriptive failure context (#550-#553).**
   Replaced bare `unwrap()` calls with `expect()` messages describing the
   expected operation.

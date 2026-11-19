@@ -1038,11 +1038,12 @@ async fn test_server() -> TestServer {
 const EXPECTED_CSP: &str = "default-src 'none'; \
      script-src 'self'; \
      style-src 'self'; \
-     img-src 'self' data:; \
+     img-src 'self'; \
      connect-src 'self'; \
      form-action 'none'; \
      frame-ancestors 'none'; \
-     base-uri 'none'";
+     base-uri 'none'; \
+     require-trusted-types-for 'script'";
 
 /// Every dashboard asset must be served with its exact content type, the full
 /// CSP, and the baseline security headers the outer layers add (#637).
@@ -1367,4 +1368,71 @@ fn issue_964_payments_caption_tracks_filters() {
         JS.matches("updatePaymentsCaption();").count() >= 2,
         "the caption must refresh on filter changes and on row render (#964)"
     );
+}
+
+/// The favicon is a routed static file, so the CSP needs neither `data:` in
+/// `img-src` (#798) nor an inline icon in the page, and Trusted Types are
+/// enforced for script sinks (#799).
+#[tokio::test]
+async fn favicon_is_served_and_csp_is_tight() {
+    let server = test_server().await;
+
+    let res = server.get("/dashboard/favicon.svg").await;
+    res.assert_status_ok();
+    assert_eq!(res.header("content-type"), "image/svg+xml");
+    let csp = res.header("content-security-policy").to_str().unwrap().to_owned();
+    assert!(!csp.contains("data:"), "CSP must not allow data: URIs: {csp}");
+    assert!(csp.contains("require-trusted-types-for 'script'"), "{csp}");
+    assert!(DASHBOARD_HTML.contains("/dashboard/favicon.svg"));
+    assert!(!DASHBOARD_HTML.contains("data:image"));
+}
+
+/// Sign-out must empty the DOM containers that held payment data (#797).
+#[test]
+fn sign_out_wipes_payment_data() {
+    let start = DASHBOARD_JS.find("function wipePaymentData").expect("wipe fn");
+    let body = &DASHBOARD_JS[start..start + 900];
+    for id in ["rows", "summary", "detail-fields", "deliveries"] {
+        assert!(body.contains(&format!("\"{id}\"")), "{id} not wiped");
+    }
+    assert!(DASHBOARD_JS.contains("loadedPayments: []"));
+    assert!(DASHBOARD_JS.contains("wipePaymentData();"));
+}
+
+/// Page Visibility pauses polling and refreshes once on return (#803).
+#[test]
+fn polling_pauses_while_tab_hidden() {
+    assert!(DASHBOARD_JS.contains("document.hidden"));
+    assert!(DASHBOARD_JS.contains("visibilitychange"));
+}
+
+/// Assets carry an ETag, answer If-None-Match with 304, use `no-cache`, and
+/// vary on Accept-Encoding (#801, #802).
+#[tokio::test]
+async fn dashboard_assets_support_etag_and_vary() {
+    let server = test_server().await;
+    let res = server.get("/dashboard/app.js").await;
+    res.assert_status_ok();
+    let etag = res.header("etag").to_str().unwrap().to_string();
+    assert_eq!(res.header("cache-control"), "no-cache");
+    assert_eq!(res.header("vary"), "Accept-Encoding");
+    let res = server
+        .get("/dashboard/app.js")
+        .add_header("if-none-match", etag.as_str())
+        .await;
+    res.assert_status(axum::http::StatusCode::NOT_MODIFIED);
+    assert_eq!(res.header("etag").to_str().unwrap(), etag);
+}
+
+/// gzip is negotiated for dashboard assets (#802).
+#[tokio::test]
+async fn dashboard_assets_are_gzip_compressed() {
+    let server = test_server().await;
+    let res = server
+        .get("/dashboard/app.js")
+        .add_header("accept-encoding", "gzip")
+        .await;
+    res.assert_status_ok();
+    assert_eq!(res.header("content-encoding"), "gzip");
+    assert_eq!(res.header("vary"), "Accept-Encoding");
 }
