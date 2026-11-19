@@ -306,6 +306,13 @@
             <button class="ghost preset" type="button" data-days="7" aria-pressed="false">Last 7 days</button>
             <button class="ghost preset" type="button" data-days="30" aria-pressed="false">Last 30 days</button>
           </div>
+          <div class="filters" role="group" aria-label="Filter by amount">
+            <label class="small" for="min-amount">Min amount</label>
+            <input id="min-amount" type="text" inputmode="decimal" autocomplete="off" placeholder="0" />
+            <label class="small" for="max-amount">Max amount</label>
+            <input id="max-amount" type="text" inputmode="decimal" autocomplete="off" placeholder="any" />
+            <span id="amount-filter-note" class="muted small" hidden>Filters loaded rows only</span>
+          </div>
           <label class="small checkbox" for="auto-refresh">
             <input id="auto-refresh" type="checkbox" />
             <span>Auto-refresh</span>

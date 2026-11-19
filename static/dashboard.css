@@ -1547,6 +1547,15 @@ dialog::backdrop {
   #invoice-qr { break-inside: avoid; }
 }
 
+/* #781: briefly highlight rows that arrived in the latest refresh. */
+tr.row-new { background: color-mix(in srgb, var(--accent, #3b82f6) 18%, transparent); }
+@media (prefers-reduced-motion: no-preference) {
+  tr.row-new { animation: row-new-fade 4s ease-out; }
+}
+@keyframes row-new-fade {
+  from { background: color-mix(in srgb, var(--accent, #3b82f6) 35%, transparent); }
+}
+
 /* Detail drawer: timeline, shortfall, raw JSON, prev/next (#785-#788) */
 .timeline { list-style: none; margin: 0 0 1rem; padding-inline-start: 1rem; border-inline-start: 2px solid var(--border, #ccc); }
 .timeline li { position: relative; padding: 0.25rem 0 0.5rem 0.5rem; }

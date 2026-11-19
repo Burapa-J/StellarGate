@@ -20,7 +20,7 @@
  * `node --test`, which is what makes these modules unit-testable (issue #723).
  * The file names match the routes they are served on, so `./format.js` is
  * `/dashboard/format.js` once the page loads. */
-import { filterPayments } from "./format.js";
+import { filterByAmount, filterPayments } from "./format.js";
 
 /**
  * A payment as returned by `GET /payments` (see `openapi.yaml`).
@@ -96,6 +96,9 @@ export function initialState() {
     pageSize: 25,
     createdAfter: "",
     createdBefore: "",
+    /** Client-side amount range filter, decimal strings (#782). */
+    minAmount: "",
+    maxAmount: "",
     autoRefresh: false,
     cursor: null,
     loading: false,
@@ -214,7 +217,11 @@ export function createStore(seed) {
 
   /** The rows currently on screen: loaded rows narrowed by the search box. */
   function visiblePayments() {
-    return filterPayments(state.loadedPayments, state.search);
+    return filterByAmount(
+      filterPayments(state.loadedPayments, state.search),
+      state.minAmount,
+      state.maxAmount
+    );
   }
 
   /**
