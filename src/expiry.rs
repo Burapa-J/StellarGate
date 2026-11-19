@@ -49,10 +49,10 @@ pub async fn sweep_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
 /// Background loop that sweeps expired intents on the configured poll interval
 /// until the process shuts down.
 pub async fn run_sweeper(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) -> TaskExit {
-    let interval = Duration::from_secs(state.config.poll_interval_secs.max(1));
+    let interval = Duration::from_secs(state.config.expiry_sweep_interval_secs.max(1));
     info!(
         ttl_secs = state.config.payment_ttl_secs,
-        interval_secs = state.config.poll_interval_secs,
+        interval_secs = state.config.expiry_sweep_interval_secs,
         "expiry sweeper started"
     );
 
@@ -106,6 +106,8 @@ mod tests {
             webhook_delivery_retention_days: 30,
             idempotency_retention_days: 7,
             poll_interval_secs: 10,
+            expiry_sweep_interval_secs: 10,
+            trustline_check_interval_secs: 3600,
             poll_max_pages_per_cycle: 50,
             payment_ttl_secs: 3600,
             rate_limit_requests_per_sec: 1000,

@@ -147,6 +147,8 @@ mod tests {
             webhook_delivery_retention_days: delivery_days,
             idempotency_retention_days: idempotency_days,
             poll_interval_secs: 10,
+            expiry_sweep_interval_secs: 10,
+            trustline_check_interval_secs: 3600,
             poll_max_pages_per_cycle: 50,
             payment_ttl_secs: 3600,
             rate_limit_requests_per_sec: 1000,

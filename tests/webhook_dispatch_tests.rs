@@ -44,6 +44,8 @@ fn make_config(webhook_secret: &str, retry_attempts: u32) -> Config {
         webhook_delivery_retention_days: 30,
         idempotency_retention_days: 7,
         poll_interval_secs: 10,
+        expiry_sweep_interval_secs: 10,
+        trustline_check_interval_secs: 3600,
         poll_max_pages_per_cycle: 50,
         payment_ttl_secs: 3600,
         cors_allowed_origins: vec![],

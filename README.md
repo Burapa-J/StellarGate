@@ -311,10 +311,10 @@ first deploy.**
 **The check doesn't stop at boot.** A trustline can be removed at any time
 after startup — by the account operator, or by an issuer revoking
 authorization — and an asset can be added to `ACCEPTED_ASSETS` on a redeploy.
-A background `trustline_checker` task re-runs the same check on the retention
-worker's cadence (`RETENTION_INTERVAL_SECS`, default 1 hour) for as long as
-the gateway wallet is configured, so drift after boot is caught rather than
-only ever logged once.
+A background `trustline_checker` task re-runs the same check every
+`TRUSTLINE_CHECK_INTERVAL_SECS` (default 1 hour, independent of the retention
+worker) for as long as the gateway wallet is configured, so drift after boot is
+caught rather than only ever logged once.
 
 Current trustline state is on `GET /metrics`, so it's alertable rather than
 grep-only:
@@ -407,6 +407,7 @@ XLM free to cover one per asset.
 |---|---|---|
 | `STELLAR_LISTENER_MODE` | `stream` (SSE + poller reconciler) or `poll` (interval only) | `stream` |
 | `POLL_INTERVAL_SECS` | How often the poller reconciles | `10` |
+| `EXPIRY_SWEEP_INTERVAL_SECS` | How often the expiry sweeper transitions overdue `pending` intents to `expired`. Independent of `POLL_INTERVAL_SECS`; defaults to it, so existing deployments keep today's cadence. Must be `> 0`. | `POLL_INTERVAL_SECS` |
 | `CURSOR_STALENESS_MULTIPLE` | Multiplier on `POLL_INTERVAL_SECS` that may elapse without a successful poll/stream event before `/ready` reports the detection cursor stale (`503`). A healthy poller cycles on the poll interval, so this only trips when the poller died or the stream wedged. | `3` |
 | `POLL_MAX_PAGES_PER_CYCLE` | Maximum Horizon pages (200 records each) one poll cycle walks before yielding to the next tick. Bounds how long a catch-up can monopolise the poller; the cursor is checkpointed at every page boundary, so the next cycle resumes exactly where this one stopped. `0` = unlimited. | `50` |
 | `PAYMENT_TTL_SECS` | How long an intent stays `pending` before expiring, from `created_at` | `3600` |
@@ -528,6 +529,7 @@ down.
 | Variable | Description | Default |
 |---|---|---|
 | `RETENTION_INTERVAL_SECS` | How often the worker prunes | `3600` |
+| `TRUSTLINE_CHECK_INTERVAL_SECS` | How often the trustline checker re-verifies the gateway's trustlines for every accepted non-native asset. Must be `> 0`. | `3600` |
 | `WEBHOOK_DELIVERY_RETENTION_DAYS` | Days to keep **terminal** (`delivered`/`failed`) delivery rows. `0` keeps them forever. | `30` |
 | `IDEMPOTENCY_RETENTION_DAYS` | Days to keep idempotency keys — they only need to outlive the window in which a client might retry. `0` keeps them forever. | `7` |
 
@@ -1359,6 +1361,8 @@ Every on-chain payment matched by memo, destination, and asset resolves as follo
 | Top-up reaching exactly the total | `completed` | `payment.completed` | — |
 | Top-up exceeding the total | `completed` | `payment.overpaid` | cumulative excess |
 | TTL elapsed, unpaid | `expired` | `payment.expired` | — |
+| Paid **on time**, but the TTL passed before the sweeper ran | as paid (`completed`, or `underpaid` for a partial payment) | as paid | as paid |
+| Paid **after** the TTL, before the sweeper ran | unchanged (`pending`/`underpaid`); the sweeper then sets `expired` | `payment.unexpected` (then `payment.expired` on the sweep) | unexpected amount to refund |
 | Payment after `completed` or `expired` | unchanged | `payment.unexpected` | unexpected amount to refund |
 
 **Overpayment** fulfils the intent. The `delta` field carries the excess; refunding it is the merchant's responsibility — the gateway cannot send funds.
