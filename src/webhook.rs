@@ -719,8 +719,7 @@ mod tests {
             // Confirm the serialised bytes contain the event string, i.e. that
             // it survives the round-trip through serde_json::to_vec used in dispatch().
             let body = serde_json::to_vec(&payload).unwrap();
-            let body_str =
-                String::from_utf8(body).expect("webhook body should be valid UTF-8");
+            let body_str = String::from_utf8(body).expect("webhook body should be valid UTF-8");
             assert!(
                 body_str.contains(event),
                 "serialised body must contain the event string (event={event})"
