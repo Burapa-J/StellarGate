@@ -243,19 +243,15 @@ fn http_client(timeout: Duration) -> Result<reqwest::Client> {
         .build()?)
 }
 
-/// Report whether every accepted asset has a trustline on the gateway account.
+/// Check whether every accepted asset has a trustline on the gateway account.
 /// Advisory only: a missing trustline doesn't block boot, it just means
 /// payments in that asset will bounce until the trustline is added.
+///
+/// `check_trustlines` logs the outcome itself, so this logs only a failure to
+/// check; a successful boot check produces exactly one summary line.
 async fn report_trustlines(state: &Arc<AppState>) {
-    match horizon::check_trustlines(state).await {
-        Ok(missing) if missing.is_empty() => {
-            info!("gateway trustlines verified for all accepted assets")
-        }
-        Ok(missing) => info!(
-            ?missing,
-            "accepted assets with no trustline on the gateway account"
-        ),
-        Err(e) => warn!(error = %e, "could not verify gateway trustlines at startup"),
+    if let Err(e) = horizon::check_trustlines(state).await {
+        warn!(error = %e, "could not verify gateway trustlines at startup");
     }
 }
 
@@ -327,13 +323,7 @@ mod tests {
 
     #[test]
     fn healthcheck_url_falls_back_to_default_path() {
-        assert_eq!(
-            healthcheck_url(3000, ""),
-            "http://127.0.0.1:3000/health"
-        );
-        assert_eq!(
-            healthcheck_url(3000, "/"),
-            "http://127.0.0.1:3000/health"
-        );
+        assert_eq!(healthcheck_url(3000, ""), "http://127.0.0.1:3000/health");
+        assert_eq!(healthcheck_url(3000, "/"), "http://127.0.0.1:3000/health");
     }
 }

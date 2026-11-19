@@ -24,6 +24,13 @@ use tracing::{debug, info, warn};
 /// stall.
 const MAX_PER_CYCLE: u64 = 50_000;
 
+/// Background loop that prunes the retention tables on `RETENTION_INTERVAL_SECS`
+/// until shutdown.
+///
+/// First-run behaviour: the first prune waits one full interval after startup,
+/// by design. Pruning is batched housekeeping, not a correctness step, so it
+/// does not need to race startup traffic. Startup reconciliation is handled by
+/// the poller and sweeper, which run immediately.
 pub async fn run_retention_worker(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
     let interval = Duration::from_secs(state.config.retention_interval_secs.max(1));
 
@@ -205,9 +212,7 @@ mod tests {
             .expect("pending delivery count should load from sqlite");
         }
 
-        let (deliveries, _) = prune_once(&state)
-            .await
-            .expect("prune_once should succeed");
+        let (deliveries, _) = prune_once(&state).await.expect("prune_once should succeed");
         assert_eq!(deliveries, 2, "both aged terminal rows should go");
 
         let left: Vec<String> = sqlx::query_scalar("SELECT id FROM webhook_deliveries ORDER BY id")
