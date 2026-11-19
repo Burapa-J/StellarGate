@@ -1347,6 +1347,8 @@ Every on-chain payment matched by memo, destination, and asset resolves as follo
 | Top-up reaching exactly the total | `completed` | `payment.completed` | — |
 | Top-up exceeding the total | `completed` | `payment.overpaid` | cumulative excess |
 | TTL elapsed, unpaid | `expired` | `payment.expired` | — |
+| Paid **on time**, but the TTL passed before the sweeper ran | as paid (`completed`, or `underpaid` for a partial payment) | as paid | as paid |
+| Paid **after** the TTL, before the sweeper ran | unchanged (`pending`/`underpaid`); the sweeper then sets `expired` | `payment.unexpected` (then `payment.expired` on the sweep) | unexpected amount to refund |
 | Payment after `completed` or `expired` | unchanged | `payment.unexpected` | unexpected amount to refund |
 
 **Overpayment** fulfils the intent. The `delta` field carries the excess; refunding it is the merchant's responsibility — the gateway cannot send funds.

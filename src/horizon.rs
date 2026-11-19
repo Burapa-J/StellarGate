@@ -1177,15 +1177,66 @@ pub async fn reconcile_payment(state: &Arc<AppState>, hp: &HorizonPayment) -> an
     // terminal one — a customer who pays after completion/expiry has lost real
     // funds that the gateway is the only component that can see (issue #232).
     if let Some(payment) = db::find_by_memo_any_status(&state.pool, memo).await? {
-        // Only act on terminal intents (completed/expired). An underpaid intent
-        // that somehow slipped through the active check (extremely unlikely) is
-        // simply left alone.
+        /* Still `pending`/`underpaid` here means the intent is past `expires_at`
+        (the fast path skips those) but the sweeper has not expired it yet
+        (issue #979). */
+        if matches!(payment.status.as_str(), "pending" | "underpaid") {
+            return reconcile_overdue_intent(state, hp, payment).await;
+        }
+
+        // Only act on terminal intents (completed/expired).
         if payment.status == "completed" || payment.status == "expired" {
             reconcile_post_terminal_payment(state, hp, &payment).await?;
         }
     }
 
     Ok(false)
+}
+
+/// Handle a payment for an intent that is past its `expires_at` but has not
+/// been swept yet (issue #979).
+///
+/// The sweeper runs on its own interval, so such an intent still reads
+/// `pending` or `underpaid`, and the active lookup skips it. Without this
+/// branch the payment was silently dropped, and the merchant later received
+/// `payment.expired` for an intent the customer had paid.
+///
+/// Policy (see the README's Payment Resolution Policy):
+/// - Paid **at or before** `expires_at`: the customer was on time, so the
+///   payment settles through the normal path. The sweeper then sees a
+///   non-pending status and does not expire it.
+/// - Paid **after** `expires_at`, or the timestamp cannot be read: the
+///   transaction is recorded and reported as `payment.unexpected`, so the
+///   merchant can refund. The intent's status is left for the sweeper.
+async fn reconcile_overdue_intent(
+    state: &Arc<AppState>,
+    hp: &HorizonPayment,
+    payment: db::Payment,
+) -> anyhow::Result<bool> {
+    let paid_at = hp
+        .created_at
+        .as_deref()
+        .and_then(|t| OffsetDateTime::parse(t, &Rfc3339).ok());
+    let deadline = OffsetDateTime::parse(&payment.expires_at, &Rfc3339).ok();
+
+    match (paid_at, deadline) {
+        (Some(paid_at), Some(deadline)) if paid_at <= deadline => {
+            info!(
+                payment_id = %payment.id,
+                "payment landed before expires_at; settling before the sweeper runs"
+            );
+            reconcile_active_payment(state, hp, payment).await
+        }
+        _ => {
+            warn!(
+                payment_id = %payment.id,
+                expires_at = %payment.expires_at,
+                "payment landed after expires_at but before the sweeper ran; reporting it as unexpected"
+            );
+            reconcile_post_terminal_payment(state, hp, &payment).await?;
+            Ok(false)
+        }
+    }
 }
 
 /// Handle a Horizon payment that matches an **active** (pending/underpaid)
