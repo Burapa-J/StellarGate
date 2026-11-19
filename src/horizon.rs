@@ -694,6 +694,19 @@ pub fn trustline_headroom<'a>(
         .collect()
 }
 
+/// Headroom, in stroops, below which `check_trustlines` warns that a large
+/// inbound payment may be rejected on-chain: 10 whole units of the asset.
+///
+/// The same threshold applies to every asset, so "10 units" is a different
+/// amount of value for XLM than for a high-value asset; the metric is the
+/// precise, per-asset signal.
+pub const TRUSTLINE_HEADROOM_WARN_STROOPS: i64 = 10 * money::STROOPS_PER_UNIT;
+
+/// `true` when `stroops` of headroom is below [`TRUSTLINE_HEADROOM_WARN_STROOPS`].
+pub fn headroom_below_warn_threshold(stroops: i64) -> bool {
+    stroops < TRUSTLINE_HEADROOM_WARN_STROOPS
+}
+
 /// Build the Horizon `/accounts/{id}` URL for the given account.
 ///
 /// Written fresh (rather than restored from history) because an earlier
@@ -826,11 +839,10 @@ pub async fn check_trustlines(state: &Arc<AppState>) -> anyhow::Result<Vec<Strin
     // Compute headroom (limit - balance in stroops) for alerting on capacity.
     let headroom = trustline_headroom(&state.config.accepted_assets, &account.balances);
     for (asset, stroops) in &headroom {
-        // Warn when headroom is below ~10 XLM-equivalent (10_000_000 stroops)
-        // in absolute terms — an early signal that a large inbound payment could
-        // be rejected. The threshold is informational; the metric itself is the
-        // authoritative, alertable signal.
-        if *stroops < 10_000_000 {
+        // An early signal that a large inbound payment could be rejected. The
+        // threshold is informational; the metric itself is the authoritative,
+        // alertable signal.
+        if headroom_below_warn_threshold(*stroops) {
             warn!(
                 asset = %asset.code,
                 headroom_stroops = %stroops,
@@ -864,6 +876,10 @@ pub async fn check_trustlines(state: &Arc<AppState>) -> anyhow::Result<Vec<Strin
 /// for as long as the gateway wallet is configured — a trustline can be
 /// revoked, or an asset added to `ACCEPTED_ASSETS`, at any time after boot, so
 /// a boot-only check would go stale the moment either happens.
+///
+/// First-run behaviour: this task does not check at startup. The boot check is
+/// `main::report_trustlines`, which runs before the workers are spawned, and
+/// the first periodic re-check happens one interval after boot.
 pub async fn run_trustline_checker(
     state: Arc<AppState>,
     mut shutdown: watch::Receiver<bool>,
@@ -889,15 +905,10 @@ pub async fn run_trustline_checker(
             }
         }
 
-        match check_trustlines(&state).await {
-            Ok(missing) if missing.is_empty() => {
-                debug!("trustline check: all accepted assets have a trustline")
-            }
-            Ok(missing) => info!(
-                ?missing,
-                "accepted assets with no trustline on the gateway account"
-            ),
-            Err(e) => warn!(error = %e, "could not verify gateway trustlines"),
+        // `check_trustlines` logs the outcome itself; only a failure to check
+        // reaches this loop.
+        if let Err(e) = check_trustlines(&state).await {
+            warn!(error = %e, "could not verify gateway trustlines");
         }
     }
 }
@@ -1120,6 +1131,9 @@ pub async fn poll_once(
             .and_then(elapsed_secs)
         {
             info!(cursor_age_secs, "poller cursor advanced");
+            state
+                .horizon_metrics
+                .record_cursor_age_secs(cursor_age_secs.max(0) as u64);
         }
 
         /* Checkpoint after the whole page is processed. If we crash mid-page the
@@ -1164,6 +1178,19 @@ pub async fn poll_once(
 /// This is intentionally `pub` so integration tests can drive concurrent
 /// reconciliations to verify the single-settlement guarantee (issue #155).
 pub async fn reconcile_payment(state: &Arc<AppState>, hp: &HorizonPayment) -> anyhow::Result<bool> {
+    /* A record with no transaction hash cannot be deduplicated: every such
+    record would share one processed-transactions key, so all but the first
+    would be dropped as already seen (issue #224). Reject it before anything is
+    recorded, and count it so an unexpected payload is visible in `/metrics`. */
+    if hp.transaction_hash.as_deref().is_none_or(str::is_empty) {
+        state.horizon_metrics.record_unhashed_record_skipped();
+        warn!(
+            paging_token = ?hp.paging_token,
+            "skipping Horizon payment record with no transaction hash"
+        );
+        return Ok(false);
+    }
+
     let memo = match hp.memo() {
         Some(m) => m,
         None => return Ok(false),
@@ -1481,8 +1508,44 @@ fn next_poll_delay(consecutive_failures: u32, retry_after: Option<Duration>) -> 
     })
 }
 
+/// Consecutive non-rate-limit 4xx poll failures at one cursor position that
+/// make up one repeated-cursor incident.
+const REPEATED_CURSOR_4XX_THRESHOLD: u32 = 3;
+
+/// Tracks the run of non-rate-limit 4xx poll failures that share a cursor
+/// position. Any success, or any failure that is not such a 4xx, ends the run;
+/// so does the cursor moving, because then the failures no longer share a
+/// position.
+#[derive(Debug, Default)]
+struct CursorRejectTracker {
+    cursor: Option<String>,
+    streak: u32,
+}
+
+impl CursorRejectTracker {
+    /// Record a 4xx at `cursor`. Returns `true` only on the observation that
+    /// completes an incident, so each incident is counted once.
+    fn observe(&mut self, cursor: Option<String>) -> bool {
+        if self.cursor != cursor {
+            self.cursor = cursor;
+            self.streak = 0;
+        }
+        self.streak += 1;
+        self.streak == REPEATED_CURSOR_4XX_THRESHOLD
+    }
+
+    /// End the current run (after a success or a non-4xx failure).
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// Background loop that polls Horizon on the configured interval until the
 /// process shuts down. Idles (without polling) while no gateway is configured.
+///
+/// The first poll cycle runs immediately at startup, without waiting
+/// `POLL_INTERVAL_SECS`, so payments that landed while the process was down
+/// are reconciled straight away. Later cycles wait the configured interval.
 ///
 /// A failed cycle no longer waits out the fixed `POLL_INTERVAL_SECS` before
 /// trying again at the same rate that likely caused it (issue #313): a `429`
@@ -1503,7 +1566,10 @@ pub async fn run_poller(state: Arc<AppState>, mut shutdown: watch::Receiver<bool
     );
 
     let mut consecutive_failures: u32 = 0;
-    let mut next_delay = interval;
+    // Zero for the first cycle: run once right away rather than after a full
+    // interval. Every outcome below then sets this to the real delay.
+    let mut next_delay = Duration::ZERO;
+    let mut cursor_rejects = CursorRejectTracker::default();
 
     loop {
         tokio::select! {
@@ -1522,6 +1588,7 @@ pub async fn run_poller(state: Arc<AppState>, mut shutdown: watch::Receiver<bool
                     info!(settled = n, "poll cycle settled payments");
                 }
                 state.horizon_metrics.record_success();
+                cursor_rejects.reset();
                 consecutive_failures = 0;
                 next_delay = interval;
             }
@@ -1530,11 +1597,34 @@ pub async fn run_poller(state: Arc<AppState>, mut shutdown: watch::Receiver<bool
                 let horizon_err = e.downcast_ref::<HorizonHttpError>();
                 let rate_limited = horizon_err.is_some_and(|he| he.is_rate_limited());
                 let retry_after = horizon_err.and_then(|he| he.retry_after);
+                let cursor_rejected = horizon_err
+                    .is_some_and(|he| he.status.is_client_error() && !he.is_rate_limited());
 
                 if rate_limited {
                     state.horizon_metrics.record_rate_limited();
                 } else {
                     state.horizon_metrics.record_error();
+                }
+
+                if cursor_rejected {
+                    /* Read the persisted cursor so "same cursor position" is
+                    judged against what the next cycle will actually request.
+                    A failed read counts as an unknown position, which still
+                    groups consecutive failures together. */
+                    let cursor = db::get_state(&state.pool, PAYMENT_CURSOR_KEY)
+                        .await
+                        .ok()
+                        .flatten();
+                    if cursor_rejects.observe(cursor) {
+                        state.horizon_metrics.record_repeated_cursor_4xx();
+                        warn!(
+                            threshold = REPEATED_CURSOR_4XX_THRESHOLD,
+                            "Horizon repeatedly rejected the poll cursor with a 4xx; \
+                             the cursor may be invalid"
+                        );
+                    }
+                } else {
+                    cursor_rejects.reset();
                 }
 
                 next_delay = next_poll_delay(consecutive_failures, retry_after);
@@ -1800,6 +1890,9 @@ async fn handle_stream_event(state: &Arc<AppState>, block: &str, cursor: &mut St
         Ok(hp) => {
             if let Some(cursor_age_secs) = hp.created_at.as_deref().and_then(elapsed_secs) {
                 info!(cursor_age_secs, "stream cursor advanced");
+                state
+                    .horizon_metrics
+                    .record_cursor_age_secs(cursor_age_secs.max(0) as u64);
             }
             /* No stream-side retry. A failure here leaves the poller's cursor
             before this record, so the poller re-reads and retries it on its
@@ -2188,6 +2281,149 @@ mod tests {
         let assets = test_assets();
         let balances = [native_balance(), issued_balance("USDC", "GUSDC")];
         assert!(missing_trustlines(&assets, &balances).is_empty());
+    }
+
+    /// Issue #985: the warning threshold is 10 whole units, and is written in
+    /// terms of `STROOPS_PER_UNIT`, not a bare literal.
+    #[test]
+    fn trustline_warn_threshold_is_ten_units() {
+        assert_eq!(TRUSTLINE_HEADROOM_WARN_STROOPS, 100_000_000);
+        assert_eq!(
+            TRUSTLINE_HEADROOM_WARN_STROOPS,
+            10 * money::STROOPS_PER_UNIT
+        );
+    }
+
+    /// Issue #985: the boundary sits at 10 units. Headroom just under it warns;
+    /// headroom at it does not. Five units of headroom now warns, where the old
+    /// one-unit threshold stayed silent.
+    #[test]
+    fn trustline_headroom_warning_boundary_is_ten_units() {
+        assert!(headroom_below_warn_threshold(
+            TRUSTLINE_HEADROOM_WARN_STROOPS - 1
+        ));
+        assert!(!headroom_below_warn_threshold(
+            TRUSTLINE_HEADROOM_WARN_STROOPS
+        ));
+        assert!(headroom_below_warn_threshold(5 * money::STROOPS_PER_UNIT));
+    }
+
+    /// Issue #987 (repeated cursor 4xx): three consecutive 4xx failures at one
+    /// cursor form exactly one incident, and a fourth is not a second one.
+    #[test]
+    fn repeated_cursor_4xx_counts_one_incident_per_three_failures() {
+        let mut t = CursorRejectTracker::default();
+        let c = Some("123".to_string());
+        assert!(!t.observe(c.clone()));
+        assert!(!t.observe(c.clone()));
+        assert!(
+            t.observe(c.clone()),
+            "third failure at one cursor is an incident"
+        );
+        assert!(
+            !t.observe(c.clone()),
+            "a fourth failure is not a second incident"
+        );
+    }
+
+    /// The run ends on success (reset) or when the cursor moves, so a new
+    /// streak must build up from scratch before it counts as an incident.
+    #[test]
+    fn repeated_cursor_4xx_run_restarts_after_reset_or_cursor_move() {
+        let mut t = CursorRejectTracker::default();
+        let c = Some("1".to_string());
+        assert!(!t.observe(c.clone()));
+        assert!(!t.observe(c.clone()));
+        t.reset();
+        assert!(!t.observe(c.clone()));
+        assert!(
+            !t.observe(Some("2".into())),
+            "cursor moved: streak restarts"
+        );
+        assert!(!t.observe(Some("2".into())));
+        assert!(t.observe(Some("2".into())));
+    }
+
+    /// Issue #987 (skipped records): a record with no transaction hash is
+    /// rejected before anything is recorded, and each one is counted. Both a
+    /// missing and an empty hash count.
+    #[tokio::test]
+    async fn unhashed_record_is_rejected_and_counted() {
+        let state = Arc::new(
+            crate::expiry::tests::memory_state(crate::expiry::tests::test_config(true)).await,
+        );
+        let mut hp = native_payment("1", "MEMO1234", "GGATEWAY");
+        hp.transaction_hash = None;
+        assert!(!reconcile_payment(&state, &hp).await.unwrap());
+        assert_eq!(state.horizon_metrics.unhashed_records_skipped(), 1);
+
+        hp.transaction_hash = Some(String::new());
+        assert!(!reconcile_payment(&state, &hp).await.unwrap());
+        assert_eq!(state.horizon_metrics.unhashed_records_skipped(), 2);
+    }
+
+    /// Issue #987 (cursor age): a streamed record's age is stored in the
+    /// gauge, not only logged. A record created 120 s ago reads as about 120 s.
+    #[tokio::test]
+    async fn stream_event_records_cursor_age_in_the_gauge() {
+        let state = Arc::new(
+            crate::expiry::tests::memory_state(crate::expiry::tests::test_config(true)).await,
+        );
+        assert_eq!(state.horizon_metrics.cursor_age_secs(), 0);
+
+        let created = (OffsetDateTime::now_utc() - time::Duration::seconds(120))
+            .format(&Rfc3339)
+            .unwrap();
+        let json = format!(
+            r#"{{"type":"payment","transaction_hash":"abc","paging_token":"5","created_at":"{created}"}}"#
+        );
+        let block = format!("id: 5\ndata: {json}");
+        let mut cursor = String::new();
+        handle_stream_event(&state, &block, &mut cursor).await;
+
+        let age = state.horizon_metrics.cursor_age_secs();
+        assert!((120..125).contains(&age), "cursor age was {age}");
+    }
+
+    /// Issue #984: with a long poll interval, the poller's first cycle runs at
+    /// startup. Horizon is mocked and the persisted cursor is set, so the
+    /// poller only needs to complete one successful cycle.
+    #[tokio::test]
+    async fn poller_runs_its_first_cycle_at_startup_without_waiting_an_interval() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"_embedded": {"records": []}})),
+            )
+            .mount(&server)
+            .await;
+
+        let mut cfg = crate::expiry::tests::test_config(true);
+        cfg.horizon_url = server.uri();
+        cfg.poll_interval_secs = 3600;
+        let state = Arc::new(crate::expiry::tests::memory_state(cfg).await);
+        db::set_state(&state.pool, PAYMENT_CURSOR_KEY, "100")
+            .await
+            .unwrap();
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let poller = tokio::spawn(run_poller(state.clone(), shutdown_rx));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while state.horizon_metrics.success() == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the first poll cycle must run at startup, not after POLL_INTERVAL_SECS"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        shutdown_tx.send(true).unwrap();
+        poller.await.unwrap();
     }
 
     #[test]

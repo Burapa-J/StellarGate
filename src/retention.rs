@@ -25,6 +25,13 @@ use tracing::{debug, info, warn};
 /// stall.
 const MAX_PER_CYCLE: u64 = 50_000;
 
+/// Background loop that prunes the retention tables on `RETENTION_INTERVAL_SECS`
+/// until shutdown.
+///
+/// First-run behaviour: the first prune waits one full interval after startup,
+/// by design. Pruning is batched housekeeping, not a correctness step, so it
+/// does not need to race startup traffic. Startup reconciliation is handled by
+/// the poller and sweeper, which run immediately.
 pub async fn run_retention_worker(
     state: Arc<AppState>,
     mut shutdown: watch::Receiver<bool>,
