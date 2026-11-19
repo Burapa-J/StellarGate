@@ -206,13 +206,17 @@ fn healthcheck_url(port: u16, path: &str) -> String {
     format!("http://127.0.0.1:{port}/{path}")
 }
 
+/// Resolve the port the `healthcheck` subcommand probes from the raw `PORT`
+/// value: the parsed port when it is a valid `u16`, otherwise the server's
+/// default of 3000.
+fn healthcheck_port(raw: Option<&str>) -> u16 {
+    raw.and_then(|p| p.parse::<u16>().ok()).unwrap_or(3000)
+}
+
 /// Probe the local server's health endpoint and return the process exit code:
 /// `0` when the endpoint answers with a success status, `1` otherwise.
 async fn run_healthcheck(path: &str) -> i32 {
-    let port = std::env::var("PORT")
-        .ok()
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(3000);
+    let port = healthcheck_port(std::env::var("PORT").ok().as_deref());
     let url = healthcheck_url(port, path);
 
     let client = match reqwest::Client::builder()
@@ -306,6 +310,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn healthcheck_port_uses_configured_value() {
+        assert_eq!(healthcheck_port(Some("8080")), 8080);
+    }
+
+    #[test]
+    fn healthcheck_port_defaults_to_3000_when_unset() {
+        assert_eq!(healthcheck_port(None), 3000);
+    }
+
+    #[test]
+    fn healthcheck_port_falls_back_on_unparseable_value() {
+        assert_eq!(healthcheck_port(Some("not-a-port")), 3000);
+        assert_eq!(healthcheck_port(Some("70000")), 3000);
+    }
+
+    #[test]
     fn healthcheck_url_uses_port_and_path() {
         assert_eq!(
             healthcheck_url(3000, "health"),
@@ -331,13 +351,7 @@ mod tests {
 
     #[test]
     fn healthcheck_url_falls_back_to_default_path() {
-        assert_eq!(
-            healthcheck_url(3000, ""),
-            "http://127.0.0.1:3000/health"
-        );
-        assert_eq!(
-            healthcheck_url(3000, "/"),
-            "http://127.0.0.1:3000/health"
-        );
+        assert_eq!(healthcheck_url(3000, ""), "http://127.0.0.1:3000/health");
+        assert_eq!(healthcheck_url(3000, "/"), "http://127.0.0.1:3000/health");
     }
 }
