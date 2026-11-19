@@ -38,6 +38,7 @@ fn shared_memory_dsn() -> String {
 fn make_config(horizon_url: &str) -> Config {
     Config {
         port: 0,
+        bind_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
         database_url: shared_memory_dsn(),
         network: "testnet".into(),
         horizon_url: horizon_url.into(),
@@ -59,6 +60,8 @@ fn make_config(horizon_url: &str) -> Config {
         webhook_delivery_retention_days: 30,
         idempotency_retention_days: 7,
         poll_interval_secs: 10,
+        expiry_sweep_interval_secs: 10,
+        trustline_check_interval_secs: 3600,
         poll_max_pages_per_cycle: 50,
         payment_ttl_secs: 3600,
         cors_allowed_origins: vec![],

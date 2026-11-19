@@ -280,16 +280,6 @@ impl TaskHealth {
             .count() as u64
     }
 
-    /// Names of every known task that is currently running, for shutdown logs.
-    pub fn running_tasks(&self) -> Vec<&'static str> {
-        let tasks = self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner());
-        tasks
-            .iter()
-            .filter(|(_, state)| state.running)
-            .map(|(name, _)| *name)
-            .collect()
-    }
-
     /// Total task panics across all tasks (not Fatal exits — those are not
     /// panics).
     pub fn failed(&self) -> u64 {

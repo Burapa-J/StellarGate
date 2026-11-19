@@ -774,11 +774,13 @@ pub async fn list_pending(pool: &Db) -> Result<Vec<Payment>> {
     Ok(rows.iter().map(row_to_payment).collect())
 }
 
-/// Transition every watchable payment whose TTL has elapsed to `expired`,
-/// returning the rows that were swept so the caller can fire `payment.expired`
-/// webhooks. Each row is updated with a guard on a watchable status so a payment
-/// that settles concurrently is left untouched and not double-reported.
-pub async fn expire_overdue(pool: &Db, limit: i64) -> Result<Vec<Payment>> {
+/// Transition up to `batch_size` watchable payments whose TTL has elapsed to
+/// `expired`, returning the rows that were swept so the caller can fire
+/// `payment.expired` webhooks. The batch bound keeps each sweep's result set
+/// small on a large backlog (issue #885). Each row is updated with a guard on a
+/// watchable status so a payment that settles concurrently is left untouched
+/// and not double-reported.
+pub async fn expire_overdue(pool: &Db, batch_size: i64) -> Result<Vec<Payment>> {
     let overdue = sqlx::query(
         "SELECT id, merchant_id, destination_address, memo, amount, asset, asset_issuer, status,
                 webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
@@ -788,7 +790,7 @@ pub async fn expire_overdue(pool: &Db, limit: i64) -> Result<Vec<Payment>> {
          ORDER BY created_at ASC
          LIMIT ?",
     )
-    .bind(limit)
+    .bind(batch_size)
     .fetch_all(pool)
     .await?;
 
@@ -1604,7 +1606,7 @@ mod tests {
         let pool = SqlitePoolOptions::new()
             .connect("sqlite::memory:")
             .await
-            .unwrap();
+            .expect("in-memory SQLite pool should connect");
         migrate(&pool)
             .await
             .expect("migrations should apply cleanly");
@@ -1657,13 +1659,17 @@ mod tests {
             .expect("migrations should apply successfully");
 
         assert_eq!(
-            find_merchant_by_key(&pool, legacy_key).await.unwrap(),
+            find_merchant_by_key(&pool, legacy_key)
+                .await
+                .expect("legacy key lookup by find_merchant_by_key should succeed"),
             Some("legacy-merchant".to_string()),
             "a key issued before the api_keys table must keep working"
         );
 
         // It is now a first-class key: listable, and revocable once replaced.
-        let keys = list_api_keys(&pool, "legacy-merchant").await.unwrap();
+        let keys = list_api_keys(&pool, "legacy-merchant")
+            .await
+            .expect("listing API keys for the legacy merchant should succeed");
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].prefix, "legacy");
         assert!(keys[0].revoked_at.is_none());
@@ -1694,7 +1700,9 @@ mod tests {
     async fn revoked_keys_stop_authenticating() {
         let pool = memory_db().await;
         let (raw, prefix) = generate_api_key();
-        let key_id = create_merchant(&pool, "m1", &raw, &prefix).await.unwrap();
+        let key_id = create_merchant(&pool, "m1", &raw, &prefix)
+            .await
+            .expect("creating merchant m1 should succeed");
         let (raw2, prefix2) = generate_api_key();
         create_api_key(&pool, "m1", &raw2, &prefix2, None)
             .await
@@ -1713,7 +1721,12 @@ mod tests {
                 .expect("revoking an active key should succeed"),
             RevokeKeyOutcome::Revoked
         );
-        assert_eq!(find_merchant_by_key(&pool, &raw).await.unwrap(), None);
+        assert_eq!(
+            find_merchant_by_key(&pool, &raw)
+                .await
+                .expect("lookup of a revoked key should succeed"),
+            None
+        );
 
         // Revoking again reports that nothing was revoked.
         assert_eq!(
@@ -1776,7 +1789,9 @@ mod tests {
             .await
             .expect("overdue payment should be created");
 
-        let pending = list_pending(&pool).await.unwrap();
+        let pending = list_pending(&pool)
+            .await
+            .expect("list_pending should succeed");
         let ids: Vec<&str> = pending.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(ids, vec!["live"]);
     }
@@ -1791,7 +1806,10 @@ mod tests {
             .await
             .expect("payment should transition to underpaid");
 
-        let found = find_pending_by_memo(&pool, "MEMOP").await.unwrap().unwrap();
+        let found = find_pending_by_memo(&pool, "MEMOP")
+            .await
+            .expect("find_pending_by_memo should succeed")
+            .expect("a pending intent should exist for memo MEMOP");
         assert_eq!(found.id, "partial");
         assert_eq!(found.status, "underpaid");
         assert_eq!(found.paid_amount.as_deref(), Some("3"));
@@ -1802,19 +1820,21 @@ mod tests {
         let pool = memory_db().await;
         create_payment(&pool, new_payment("partial-dead", "MEMOX", -10))
             .await
-            .unwrap();
+            .expect("creating the overdue underpaid payment should succeed");
         update_payment_status(&pool, "partial-dead", "underpaid", "TX1", "3")
             .await
-            .unwrap();
+            .expect("marking the payment underpaid should succeed");
 
         assert!(
             find_pending_by_memo(&pool, "MEMOX")
                 .await
-                .unwrap()
+                .expect("find_pending_by_memo should succeed for the overdue memo")
                 .is_none()
         );
 
-        let expired = expire_overdue(&pool, 500).await.unwrap();
+        let expired = expire_overdue(&pool, 1000)
+            .await
+            .expect("first expire_overdue sweep should succeed");
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].id, "partial-dead");
         assert_eq!(expired[0].status, "expired");
@@ -1825,28 +1845,43 @@ mod tests {
         let pool = memory_db().await;
         create_payment(&pool, new_payment("live", "MEMOL", 3600))
             .await
-            .unwrap();
+            .expect("creating the live payment should succeed");
         create_payment(&pool, new_payment("dead", "MEMOD", -10))
             .await
-            .unwrap();
+            .expect("creating the overdue payment should succeed");
 
         // First sweep expires exactly the overdue intent and returns it.
-        let expired = expire_overdue(&pool, 500).await.unwrap();
+        let expired = expire_overdue(&pool, 1000)
+            .await
+            .expect("first expire_overdue sweep should succeed");
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].id, "dead");
         assert_eq!(expired[0].status, "expired");
 
         // GET /payments/:id reflects the expired status.
-        let fetched = get_payment(&pool, "dead").await.unwrap().unwrap();
+        let fetched = get_payment(&pool, "dead")
+            .await
+            .expect("get_payment should succeed for the expired intent")
+            .expect("the expired intent should exist");
         assert_eq!(fetched.status, "expired");
         // The live intent is untouched.
         assert_eq!(
-            get_payment(&pool, "live").await.unwrap().unwrap().status,
+            get_payment(&pool, "live")
+                .await
+                .expect("get_payment should succeed for the live intent")
+                .expect("the live intent should exist")
+                .status,
             "pending"
         );
 
         // A second sweep is a no-op — nothing is double-reported.
-        assert_eq!(expire_overdue(&pool, 500).await.unwrap().len(), 0);
+        assert_eq!(
+            expire_overdue(&pool, 1000)
+                .await
+                .expect("second expire_overdue sweep should succeed")
+                .len(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -1854,7 +1889,7 @@ mod tests {
         let pool = memory_db().await;
         create_payment(&pool, new_payment("p1", "MEMOR1", 3600))
             .await
-            .unwrap();
+            .expect("creating payment p1 should succeed");
 
         save_webhook_delivery(
             &pool,
@@ -1865,10 +1900,10 @@ mod tests {
             "payment.completed",
         )
         .await
-        .unwrap();
+        .expect("saving the delivered webhook row should succeed");
         update_webhook_delivery(&pool, "delivered", "delivered", 1)
             .await
-            .unwrap();
+            .expect("marking the delivered webhook row should succeed");
 
         save_webhook_delivery(
             &pool,
@@ -1879,10 +1914,10 @@ mod tests {
             "payment.completed",
         )
         .await
-        .unwrap();
+        .expect("saving the over-cap webhook row should succeed");
         update_webhook_delivery(&pool, "over-cap", "failed", 8)
             .await
-            .unwrap();
+            .expect("marking the over-cap webhook row should succeed");
 
         save_webhook_delivery(
             &pool,
@@ -1893,9 +1928,11 @@ mod tests {
             "payment.completed",
         )
         .await
-        .unwrap();
+        .expect("saving the eligible webhook row should succeed");
 
-        let candidates = list_redrivable_deliveries(&pool, 8, 0, 0, 0).await.unwrap();
+        let candidates = list_redrivable_deliveries(&pool, 8, 0, 0, 0)
+            .await
+            .expect("list_redrivable_deliveries should succeed");
         let ids: Vec<&str> = candidates.iter().map(|d| d.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -1909,13 +1946,13 @@ mod tests {
         let pool = memory_db().await;
         create_payment(&pool, new_payment("p", "MEMOTX", 3600))
             .await
-            .unwrap();
+            .expect("creating payment p should succeed");
 
         // First time a transaction is seen it is recorded and counted.
         assert!(
             record_processed_tx(&pool, "p", "TX_A", 0, 40_000_000)
                 .await
-                .unwrap()
+                .expect("first record_processed_tx for TX_A should succeed")
         );
         assert_eq!(
             sum_processed_stroops(&pool, "p")
@@ -1928,7 +1965,7 @@ mod tests {
         assert!(
             !record_processed_tx(&pool, "p", "TX_A", 0, 40_000_000)
                 .await
-                .unwrap()
+                .expect("repeat record_processed_tx for TX_A should succeed")
         );
         assert_eq!(
             sum_processed_stroops(&pool, "p")
@@ -1941,7 +1978,7 @@ mod tests {
         assert!(
             record_processed_tx(&pool, "p", "TX_B", 0, 30_000_000)
                 .await
-                .unwrap()
+                .expect("record_processed_tx for TX_B should succeed")
         );
         assert_eq!(
             sum_processed_stroops(&pool, "p")
@@ -1955,7 +1992,7 @@ mod tests {
         assert!(
             !record_processed_tx(&pool, "p", "TX_A", 0, 40_000_000)
                 .await
-                .unwrap()
+                .expect("re-seeing an earlier record_processed_tx for TX_A should succeed")
         );
         assert_eq!(
             sum_processed_stroops(&pool, "p")
@@ -1968,7 +2005,7 @@ mod tests {
         assert!(
             record_processed_tx(&pool, "p", "TX_A", 1, 20_000_000)
                 .await
-                .unwrap()
+                .expect("record_processed_tx for TX_A operation 1 should succeed")
         );
         assert_eq!(
             sum_processed_stroops(&pool, "p")
@@ -2041,14 +2078,14 @@ mod tests {
         assert!(
             list_redrivable_deliveries(&pool, 8, 3600, 0, 0)
                 .await
-                .unwrap()
+                .expect("list_redrivable_deliveries should succeed for the fresh row")
                 .is_empty()
         );
         // ...while a zero grace window makes it immediately eligible.
         assert_eq!(
             list_redrivable_deliveries(&pool, 8, 0, 0, 0)
                 .await
-                .unwrap()
+                .expect("list_redrivable_deliveries should succeed with a zero grace window")
                 .len(),
             1
         );
@@ -2059,7 +2096,7 @@ mod tests {
         let pool = memory_db().await;
         create_payment(&pool, new_payment("p1", "MEMOR3", 3600))
             .await
-            .unwrap();
+            .expect("creating payment p1 should succeed");
         save_webhook_delivery(
             &pool,
             "crashed",
@@ -2069,14 +2106,14 @@ mod tests {
             "payment.completed",
         )
         .await
-        .unwrap();
+        .expect("saving the crashed webhook row should succeed");
 
         // attempts == 0 (never sent) is gated by grace_secs alone, not the
         // exponential backoff, even with a huge backoff floor configured.
         assert_eq!(
             list_redrivable_deliveries(&pool, 8, 0, 3600, 3600)
                 .await
-                .unwrap()
+                .expect("list_redrivable_deliveries should succeed for the never-attempted row")
                 .len(),
             1
         );
@@ -2087,20 +2124,20 @@ mod tests {
         let pool = memory_db().await;
         create_payment(&pool, new_payment("p1", "MEMOR4", 3600))
             .await
-            .unwrap();
+            .expect("creating payment p1 should succeed");
         save_webhook_delivery(&pool, "flaky", "p1", "http://x", "{}", "payment.completed")
             .await
-            .unwrap();
+            .expect("saving the flaky webhook row should succeed");
         update_webhook_delivery(&pool, "flaky", "failed", 1)
             .await
-            .unwrap();
+            .expect("marking the flaky webhook row failed should succeed");
 
         // One failed attempt (attempts=1): backoff = initial * 2^0 = initial.
         // A huge initial delay makes it ineligible even with grace_secs=0.
         assert!(
             list_redrivable_deliveries(&pool, 8, 0, 3600, 3600)
                 .await
-                .unwrap()
+                .expect("list_redrivable_deliveries should succeed during backoff")
                 .is_empty(),
             "a row with a recent failure must wait out the backoff delay"
         );
@@ -2109,7 +2146,7 @@ mod tests {
         assert!(
             list_redrivable_deliveries(&pool, 8, 3600, 0, 0)
                 .await
-                .unwrap()
+                .expect("list_redrivable_deliveries should succeed with grace_secs floor")
                 .is_empty(),
             "grace_secs must floor eligibility even when backoff computes to 0"
         );
@@ -2120,7 +2157,7 @@ mod tests {
         let pool = memory_db().await;
         create_payment(&pool, new_payment("p1", "MEMOR33", 3600))
             .await
-            .unwrap();
+            .expect("creating payment p1 should succeed");
         save_webhook_delivery(
             &pool,
             "many-failures",
@@ -2130,10 +2167,10 @@ mod tests {
             "payment.completed",
         )
         .await
-        .unwrap();
+        .expect("saving the many-failures webhook row should succeed");
         update_webhook_delivery(&pool, "many-failures", "failed", 33)
             .await
-            .unwrap();
+            .expect("marking the many-failures webhook row failed should succeed");
 
         // At attempt 33, the uncapped factor is 2^32. With the accepted
         // one-day extreme, the row must use the 86,400-second cap without
@@ -2145,11 +2182,11 @@ mod tests {
         )
         .execute(&pool)
         .await
-        .unwrap();
+        .expect("UPDATE of last_attempt to -86399 seconds should succeed");
         assert!(
             list_redrivable_deliveries(&pool, 34, 0, 86_400, 86_400)
                 .await
-                .unwrap()
+                .expect("list_redrivable_deliveries should succeed at attempt 33")
                 .is_empty(),
             "attempt 33 must remain ineligible until the configured cap elapses"
         );
@@ -2165,7 +2202,7 @@ mod tests {
         assert_eq!(
             list_redrivable_deliveries(&pool, 34, 0, 86_400, 86_400)
                 .await
-                .unwrap()
+                .expect("list_redrivable_deliveries should succeed after the cap elapsed")
                 .len(),
             1,
             "attempt 33 must become eligible immediately after the cap"
@@ -2185,7 +2222,7 @@ mod tests {
         )
         .fetch_one(&pool)
         .await
-        .unwrap();
+        .expect("sqlite_master index count query should succeed");
 
         assert_eq!(
             index_exists, 1,
@@ -2199,7 +2236,7 @@ mod tests {
         )
         .fetch_one(&pool)
         .await
-        .unwrap();
+        .expect("sqlite_master index table-name query should succeed");
 
         assert_eq!(table, "webhook_deliveries");
     }
@@ -2222,7 +2259,7 @@ mod tests {
         )
         .fetch_all(&pool)
         .await
-        .unwrap();
+        .expect("EXPLAIN QUERY PLAN should succeed");
 
         let uses_index = plan_rows
             .iter()
@@ -2252,7 +2289,7 @@ mod tests {
         let contents = b"pretend sqlite header bytes";
         let path =
             std::env::temp_dir().join(format!("stellargate-metrics-test-{}", uuid::Uuid::new_v4()));
-        std::fs::write(&path, contents).unwrap();
+        std::fs::write(&path, contents).expect("writing the fake database file should succeed");
 
         let url = format!("sqlite:{}", path.display());
         let (main, wal, shm) = file_sizes(&url);

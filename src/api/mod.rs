@@ -5,7 +5,7 @@ use axum::{
     extract::{ConnectInfo, Extension, Path, Request, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     middleware::{self, Next},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use governor::clock::{Clock, DefaultClock};
@@ -185,10 +185,9 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
     axum::Router::new()
         .route("/", get(root))
         .route("/health", get(health))
-        .route("/ready", get(ready))
-        /* Public, unauthenticated (issue #812): lets the dashboard tell a
-        testnet gateway apart from a production one without a merchant key. */
+        /* Public, unauthenticated (issue #812). */
         .route("/network", get(network_info))
+        .route("/ready", get(ready))
         /* Gated behind METRICS_TOKEN (issue #250) — unset by default, which
         denies every request rather than exposing auth/webhook counters
         anonymously. See `require_metrics_token`. */
@@ -203,23 +202,7 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         are served unauthenticated — every figure they display is fetched by
         the browser from the same authenticated endpoints a merchant would
         call directly, using an API key the operator supplies. */
-        .route("/dashboard/admin", get(dashboard_admin_html))
-        .route("/dashboard/admin.js", get(dashboard_admin_js))
-        .route("/dashboard", get(dashboard_html))
-        .route("/dashboard/app.css", get(dashboard_css))
-        .route("/dashboard/app.js", get(dashboard_js))
-        .route("/dashboard/format.js", get(dashboard_format_js))
-        /* The dashboard is split into DOM-free modules so their logic can be
-        unit tested with `node --test` (issue #723). Each is still an
-        individually allow-listed route: an unknown file under
-        /dashboard/ falls through to the JSON 404 and is never read from
-        disk, so nothing under static/ is exposed by accident. */
-        .route("/dashboard/session.js", get(dashboard_session_js))
-        .route("/dashboard/state.js", get(dashboard_state_js))
-        .route("/dashboard/keys.js", get(dashboard_keys_js))
-        .route("/dashboard/vendor/qrcode.js", get(dashboard_qrcode_js))
-        .route("/dashboard/theme.js", get(dashboard_theme_js))
-        .route("/dashboard/i18n.js", get(dashboard_i18n))
+        .merge(dashboard_routes())
         /* The versioned API surface, mounted twice.
         `/v1` is canonical. The same routes stay mounted unprefixed so every
         existing integrator keeps working — shipping versioning by breaking all
@@ -278,6 +261,31 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .with_state(state)
 }
 
+/// Dashboard asset routes, gzip/brotli compressed (#802). `Vary:
+/// Accept-Encoding` is set by `dashboard_asset` so caches key on encoding.
+fn dashboard_routes() -> axum::Router<Arc<AppState>> {
+    axum::Router::new()
+        .route("/dashboard/admin", get(dashboard_admin_html))
+        .route("/dashboard/admin.js", get(dashboard_admin_js))
+        .route("/dashboard", get(dashboard_html))
+        .route("/dashboard/app.css", get(dashboard_css))
+        .route("/dashboard/app.js", get(dashboard_js))
+        .route("/dashboard/favicon.svg", get(dashboard_favicon))
+        .route("/dashboard/i18n.js", get(dashboard_i18n))
+        .route("/dashboard/format.js", get(dashboard_format_js))
+        /* The dashboard is split into DOM-free modules so their logic can be
+        unit tested with `node --test` (issue #723). Each is still an
+        individually allow-listed route: an unknown file under
+        /dashboard/ falls through to the JSON 404 and is never read from
+        disk, so nothing under static/ is exposed by accident. */
+        .route("/dashboard/session.js", get(dashboard_session_js))
+        .route("/dashboard/state.js", get(dashboard_state_js))
+        .route("/dashboard/keys.js", get(dashboard_keys_js))
+        .route("/dashboard/vendor/qrcode.js", get(dashboard_qrcode_js))
+        .route("/dashboard/theme.js", get(dashboard_theme_js))
+        .layer(tower_http::compression::CompressionLayer::new())
+}
+
 /// The `Strict-Transport-Security` header value, or none on non-public
 /// networks. TLS is terminated by the reverse proxy in front of the app, so
 /// asserting HSTS is only meaningful where that termination is guaranteed to
@@ -305,6 +313,7 @@ fn api_v1(
     goes on each `MethodRouter` for the same reason as the merchant auth layer
     below — a 405 on a known path stays a 405 rather than becoming a 401. */
     let admin_layer = || middleware::from_fn_with_state(state.clone(), require_admin_secret);
+    let auth_layer = || middleware::from_fn_with_state(state.clone(), auth_middleware);
     let merchants = axum::Router::new()
         .route("/", post(provision_merchant).route_layer(admin_layer()))
         .route(
@@ -337,8 +346,6 @@ fn api_v1(
             auth_middleware,
         ))
     };
-
-    let auth_layer = || middleware::from_fn_with_state(state.clone(), auth_middleware);
 
     let payments_authed = axum::Router::new()
         .route("/", authed(post(payments::create).get(payments::list)))
@@ -1282,6 +1289,8 @@ const DASHBOARD_SESSION_JS: &str = include_str!("../../static/session.js");
 const DASHBOARD_STATE_JS: &str = include_str!("../../static/state.js");
 const DASHBOARD_KEYS_JS: &str = include_str!("../../static/keys.js");
 const DASHBOARD_QRCODE_JS: &str = include_str!("../../static/vendor/qrcode.js");
+const DASHBOARD_FAVICON: &str = include_str!("../../static/favicon.svg");
+const DASHBOARD_I18N_JS: &str = include_str!("../../static/i18n.js");
 const DASHBOARD_THEME_JS: &str = include_str!("../../static/dashboard-theme.js");
 
 /// Locks the dashboard to its own origin: no third-party script, style, frame
@@ -1290,77 +1299,87 @@ const DASHBOARD_THEME_JS: &str = include_str!("../../static/dashboard-theme.js")
 const DASHBOARD_CSP: &str = "default-src 'none'; \
      script-src 'self'; \
      style-src 'self'; \
-     img-src 'self' data:; \
+     img-src 'self'; \
      connect-src 'self'; \
      form-action 'none'; \
      frame-ancestors 'none'; \
-     base-uri 'none'";
+     base-uri 'none'; \
+     require-trusted-types-for 'script'";
 
-fn dashboard_asset(body: &'static str, content_type: &'static str) -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, HeaderValue::from_static(content_type)),
-            (
-                header::CONTENT_SECURITY_POLICY,
-                HeaderValue::from_static(DASHBOARD_CSP),
-            ),
-            (
-                header::X_CONTENT_TYPE_OPTIONS,
-                HeaderValue::from_static("nosniff"),
-            ),
-        ],
-        body,
-    )
+fn dashboard_asset(body: &'static str, content_type: &'static str, req: &HeaderMap) -> Response {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    body.hash(&mut h);
+    let etag = format!("\"{:x}-{:x}\"", h.finish(), body.len());
+    let mut resp = if req
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(',').any(|t| t.trim().trim_start_matches("W/") == etag || t.trim() == "*"))
+    {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        (
+            [(header::CONTENT_TYPE, HeaderValue::from_static(content_type))],
+            body,
+        )
+            .into_response()
+    };
+    let h = resp.headers_mut();
+    h.insert(header::ETAG, HeaderValue::from_str(&etag).expect("etag is ascii"));
+    // no-cache: store it, but revalidate every time so updates show at once.
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    h.insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
+    h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(DASHBOARD_CSP));
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    resp
 }
 
-async fn dashboard_html() -> impl IntoResponse {
-    dashboard_asset(DASHBOARD_HTML, "text/html; charset=utf-8")
-}
-
-async fn dashboard_css() -> impl IntoResponse {
-    dashboard_asset(DASHBOARD_CSS, "text/css; charset=utf-8")
-}
-
-async fn dashboard_js() -> impl IntoResponse {
-    dashboard_asset(DASHBOARD_JS, "text/javascript; charset=utf-8")
-}
-
-async fn dashboard_format_js() -> impl IntoResponse {
-    dashboard_asset(DASHBOARD_FORMAT_JS, "text/javascript; charset=utf-8")
-}
-
-async fn dashboard_session_js() -> impl IntoResponse {
-    dashboard_asset(DASHBOARD_SESSION_JS, "text/javascript; charset=utf-8")
-}
-
-async fn dashboard_state_js() -> impl IntoResponse {
-    dashboard_asset(DASHBOARD_STATE_JS, "text/javascript; charset=utf-8")
-}
-
-async fn dashboard_keys_js() -> impl IntoResponse {
-    dashboard_asset(DASHBOARD_KEYS_JS, "text/javascript; charset=utf-8")
-}
-
-async fn dashboard_qrcode_js() -> impl IntoResponse {
-    dashboard_asset(DASHBOARD_QRCODE_JS, "text/javascript; charset=utf-8")
-}
-
-async fn dashboard_theme_js() -> impl IntoResponse {
-    dashboard_asset(DASHBOARD_THEME_JS, "text/javascript; charset=utf-8")
-}
-
-const DASHBOARD_I18N: &str = include_str!("../../static/i18n.js");
-
-async fn dashboard_i18n() -> impl IntoResponse {
-    dashboard_asset(DASHBOARD_I18N, "text/javascript; charset=utf-8")
-}
-
-/// The configured Stellar network (`"public"` or `"testnet"`), so the
-/// dashboard can show a prominent badge rather than relying on the operator
-/// to remember which gateway they are looking at.
 async fn network_info(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({ "network": state.config.network }))
+}
+
+async fn dashboard_i18n(headers: HeaderMap) -> Response {
+    dashboard_asset(DASHBOARD_I18N_JS, "text/javascript; charset=utf-8", &headers)
+}
+
+async fn dashboard_html(headers: HeaderMap) -> Response {
+    dashboard_asset(DASHBOARD_HTML, "text/html; charset=utf-8", &headers)
+}
+
+async fn dashboard_css(headers: HeaderMap) -> Response {
+    dashboard_asset(DASHBOARD_CSS, "text/css; charset=utf-8", &headers)
+}
+
+async fn dashboard_js(headers: HeaderMap) -> Response {
+    dashboard_asset(DASHBOARD_JS, "text/javascript; charset=utf-8", &headers)
+}
+
+async fn dashboard_format_js(headers: HeaderMap) -> Response {
+    dashboard_asset(DASHBOARD_FORMAT_JS, "text/javascript; charset=utf-8", &headers)
+}
+
+async fn dashboard_session_js(headers: HeaderMap) -> Response {
+    dashboard_asset(DASHBOARD_SESSION_JS, "text/javascript; charset=utf-8", &headers)
+}
+
+async fn dashboard_state_js(headers: HeaderMap) -> Response {
+    dashboard_asset(DASHBOARD_STATE_JS, "text/javascript; charset=utf-8", &headers)
+}
+
+async fn dashboard_keys_js(headers: HeaderMap) -> Response {
+    dashboard_asset(DASHBOARD_KEYS_JS, "text/javascript; charset=utf-8", &headers)
+}
+
+async fn dashboard_qrcode_js(headers: HeaderMap) -> Response {
+    dashboard_asset(DASHBOARD_QRCODE_JS, "text/javascript; charset=utf-8", &headers)
+}
+
+async fn dashboard_theme_js(headers: HeaderMap) -> Response {
+    dashboard_asset(DASHBOARD_THEME_JS, "text/javascript; charset=utf-8", &headers)
+}
+
+async fn dashboard_favicon(headers: HeaderMap) -> Response {
+    dashboard_asset(DASHBOARD_FAVICON, "image/svg+xml", &headers)
 }
 
 async fn not_found() -> impl IntoResponse {
@@ -1884,16 +1903,18 @@ mod tests {
     }
 }
 
-async fn dashboard_admin_html() -> impl IntoResponse {
+async fn dashboard_admin_html(headers: HeaderMap) -> Response {
     dashboard_asset(
         include_str!("../../static/admin.html"),
         "text/html; charset=utf-8",
+        &headers,
     )
 }
 
-async fn dashboard_admin_js() -> impl IntoResponse {
+async fn dashboard_admin_js(headers: HeaderMap) -> Response {
     dashboard_asset(
         include_str!("../../static/admin.js"),
         "text/javascript; charset=utf-8",
+        &headers,
     )
 }
