@@ -1118,7 +1118,8 @@ mod tests {
                 ("CORS_ALLOWED_ORIGINS", Some("https://example.com")),
             ],
             || {
-                let cfg = Config::from_env().unwrap();
+                let cfg =
+                    Config::from_env().expect("config with valid public-network env should load");
                 assert_eq!(cfg.network, "public");
                 assert_eq!(
                     cfg.webhook_secret,
