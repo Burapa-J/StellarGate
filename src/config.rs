@@ -1383,8 +1383,14 @@ mod tests {
 
     #[test]
     fn listener_mode_poll_parses() {
-        assert_eq!(ListenerMode::parse("poll").unwrap(), ListenerMode::Poll);
-        assert_eq!(ListenerMode::parse("POLL").unwrap(), ListenerMode::Poll);
+        assert_eq!(
+            ListenerMode::parse("poll").expect("lowercase 'poll' should parse"),
+            ListenerMode::Poll
+        );
+        assert_eq!(
+            ListenerMode::parse("POLL").expect("uppercase 'POLL' should parse"),
+            ListenerMode::Poll
+        );
     }
 
     #[test]
