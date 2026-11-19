@@ -14,6 +14,7 @@ use time::format_description::well_known::Rfc3339;
 fn make_config() -> Config {
     Config {
         port: 0,
+        bind_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
         database_url: "sqlite::memory:".into(),
         network: "testnet".into(),
         horizon_url: String::new(),
@@ -38,6 +39,8 @@ fn make_config() -> Config {
         webhook_delivery_retention_days: 30,
         idempotency_retention_days: 7,
         poll_interval_secs: 10,
+        expiry_sweep_interval_secs: 10,
+        trustline_check_interval_secs: 3600,
         poll_max_pages_per_cycle: 50,
         payment_ttl_secs: 3600,
         /* High enough that these tests never trip the limiter; dedicated

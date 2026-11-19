@@ -53,6 +53,7 @@
 //! The matching logic in [`verify`] is pure and unit-tested; the networked
 //! functions wrap it with I/O.
 
+use crate::supervise::TaskExit;
 use crate::{AppState, db, money, webhook};
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -871,7 +872,7 @@ pub async fn check_trustlines(state: &Arc<AppState>) -> anyhow::Result<Vec<Strin
     Ok(missing_codes)
 }
 
-/// Background task that re-runs [`check_trustlines`] on `RETENTION_INTERVAL_SECS`
+/// Background task that re-runs [`check_trustlines`] on `TRUSTLINE_CHECK_INTERVAL_SECS`
 /// for as long as the gateway wallet is configured — a trustline can be
 /// revoked, or an asset added to `ACCEPTED_ASSETS`, at any time after boot, so
 /// a boot-only check would go stale the moment either happens.
@@ -889,9 +890,9 @@ pub async fn run_trustline_checker(
         );
     }
 
-    let interval = Duration::from_secs(state.config.retention_interval_secs.max(1));
+    let interval = Duration::from_secs(state.config.trustline_check_interval_secs.max(1));
     info!(
-        interval_secs = state.config.retention_interval_secs,
+        interval_secs = state.config.trustline_check_interval_secs,
         "trustline checker started"
     );
 
@@ -1099,14 +1100,28 @@ pub async fn poll_once(
         .await?;
         let count = page.len();
 
+        /* Walk the page in order and advance the in-memory cursor only past
+        records that reconciled. On the first failure, stop: the cursor stays
+        on the last good record, so the checkpoint below never skips the failed
+        payment and the next cycle re-reads it (issue #978). Re-processing the
+        records already handled is safe: `processed_transactions` dedups them. */
+        let mut reconcile_failure = None;
         for hp in &page {
-            if let Some(token) = &hp.paging_token {
-                cursor = token.clone();
-            }
             match reconcile_payment(state, hp).await {
                 Ok(true) => settled += 1,
                 Ok(false) => {}
-                Err(e) => warn!(error = %e, "failed to reconcile polled payment"),
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        paging_token = ?hp.paging_token,
+                        "failed to reconcile polled payment; holding the cursor before it"
+                    );
+                    reconcile_failure = Some(e);
+                    break;
+                }
+            }
+            if let Some(token) = &hp.paging_token {
+                cursor = token.clone();
             }
         }
 
@@ -1125,6 +1140,12 @@ pub async fn poll_once(
         cursor still points at the last fully-processed page, and re-reading
         the unfinished page is harmless (settled intents are skipped). */
         db::set_state(&state.pool, PAYMENT_CURSOR_KEY, &cursor).await?;
+
+        /* Surface the failure after the checkpoint, so the poller's backoff
+        applies and the retry starts from the last good record. */
+        if let Some(e) = reconcile_failure {
+            return Err(e.context("poll cycle stopped at a payment that failed to reconcile"));
+        }
 
         // A short page means Horizon has nothing newer — we're caught up.
         if count < PAGE_LIMIT as usize {
@@ -1184,15 +1205,66 @@ pub async fn reconcile_payment(state: &Arc<AppState>, hp: &HorizonPayment) -> an
     // terminal one — a customer who pays after completion/expiry has lost real
     // funds that the gateway is the only component that can see (issue #232).
     if let Some(payment) = db::find_by_memo_any_status(&state.pool, memo).await? {
-        // Only act on terminal intents (completed/expired). An underpaid intent
-        // that somehow slipped through the active check (extremely unlikely) is
-        // simply left alone.
+        /* Still `pending`/`underpaid` here means the intent is past `expires_at`
+        (the fast path skips those) but the sweeper has not expired it yet
+        (issue #979). */
+        if matches!(payment.status.as_str(), "pending" | "underpaid") {
+            return reconcile_overdue_intent(state, hp, payment).await;
+        }
+
+        // Only act on terminal intents (completed/expired).
         if payment.status == "completed" || payment.status == "expired" {
             reconcile_post_terminal_payment(state, hp, &payment).await?;
         }
     }
 
     Ok(false)
+}
+
+/// Handle a payment for an intent that is past its `expires_at` but has not
+/// been swept yet (issue #979).
+///
+/// The sweeper runs on its own interval, so such an intent still reads
+/// `pending` or `underpaid`, and the active lookup skips it. Without this
+/// branch the payment was silently dropped, and the merchant later received
+/// `payment.expired` for an intent the customer had paid.
+///
+/// Policy (see the README's Payment Resolution Policy):
+/// - Paid **at or before** `expires_at`: the customer was on time, so the
+///   payment settles through the normal path. The sweeper then sees a
+///   non-pending status and does not expire it.
+/// - Paid **after** `expires_at`, or the timestamp cannot be read: the
+///   transaction is recorded and reported as `payment.unexpected`, so the
+///   merchant can refund. The intent's status is left for the sweeper.
+async fn reconcile_overdue_intent(
+    state: &Arc<AppState>,
+    hp: &HorizonPayment,
+    payment: db::Payment,
+) -> anyhow::Result<bool> {
+    let paid_at = hp
+        .created_at
+        .as_deref()
+        .and_then(|t| OffsetDateTime::parse(t, &Rfc3339).ok());
+    let deadline = OffsetDateTime::parse(&payment.expires_at, &Rfc3339).ok();
+
+    match (paid_at, deadline) {
+        (Some(paid_at), Some(deadline)) if paid_at <= deadline => {
+            info!(
+                payment_id = %payment.id,
+                "payment landed before expires_at; settling before the sweeper runs"
+            );
+            reconcile_active_payment(state, hp, payment).await
+        }
+        _ => {
+            warn!(
+                payment_id = %payment.id,
+                expires_at = %payment.expires_at,
+                "payment landed after expires_at but before the sweeper ran; reporting it as unexpected"
+            );
+            reconcile_post_terminal_payment(state, hp, &payment).await?;
+            Ok(false)
+        }
+    }
 }
 
 /// Handle a Horizon payment that matches an **active** (pending/underpaid)
@@ -1242,7 +1314,13 @@ async fn reconcile_active_payment(
         .and_then(money::parse_stroops)
         .unwrap_or(0);
     let op_index = hp.operation_index();
-    if !db::record_processed_tx(&state.pool, &payment.id, hp_hash, op_index, new_stroops).await? {
+    let newly_recorded =
+        db::record_processed_tx(&state.pool, &payment.id, hp_hash, op_index, new_stroops).await?;
+    /* Already recorded and the intent has moved on: a duplicate, nothing to do.
+    Already recorded but still `pending`: an earlier attempt recorded this
+    transaction and then failed to write the status (issue #978). Re-run the
+    settlement below so the retry can finish it. */
+    if !newly_recorded && payment.status != "pending" {
         return Ok(false);
     }
 
@@ -1277,7 +1355,18 @@ async fn reconcile_active_payment(
         }
     };
 
-    let did_settle = settle(
+    /* On a re-run the transaction is already counted, so only the completing
+    transition is safe to repeat: the status guard in `update_payment_status`
+    admits a single `pending` -> `completed` write. An `underpaid` write would
+    be admitted again for a racing reconciler and fire `payment.underpaid`
+    twice, so that case is left alone. Known gap: if the interrupted attempt
+    was itself an underpayment, the intent stays `pending` until the sweeper
+    expires it. */
+    if !newly_recorded && status != "completed" {
+        return Ok(false);
+    }
+
+    settle(
         state,
         &payment,
         status,
@@ -1286,8 +1375,7 @@ async fn reconcile_active_payment(
         event,
         delta.as_deref(),
     )
-    .await;
-    Ok(did_settle)
+    .await
 }
 
 /// Handle a Horizon payment that matches a **terminal** (completed/expired)
@@ -1363,21 +1451,16 @@ async fn settle(
     paid_amount: &str,
     event: &str,
     delta: Option<&str>,
-) -> bool {
-    match db::update_payment_status(&state.pool, &payment.id, status, tx_hash, paid_amount).await {
-        Err(e) => {
-            warn!(payment_id = %payment.id, error = %e, "failed to update payment status");
-            return false;
-        }
-        Ok(false) => {
-            // A concurrent reconciler already settled this intent — skip the webhook.
-            debug!(
-                payment_id = %payment.id,
-                "skipping duplicate settlement (status guard rejected update)"
-            );
-            return false;
-        }
-        Ok(true) => {}
+) -> anyhow::Result<bool> {
+    /* A DB error is returned, not logged-and-dropped: the caller must hold the
+    poll cursor so this payment is retried (issue #978). */
+    if !db::update_payment_status(&state.pool, &payment.id, status, tx_hash, paid_amount).await? {
+        // A concurrent reconciler already settled this intent — skip the webhook.
+        debug!(
+            payment_id = %payment.id,
+            "skipping duplicate settlement (status guard rejected update)"
+        );
+        return Ok(false);
     }
     let settlement_latency_secs = elapsed_secs(&payment.created_at);
     info!(
@@ -1399,7 +1482,7 @@ async fn settle(
     worker is the safety net for the crash case, not a replacement for inline
     delivery. See issue #76 for the separate task of decoupling dispatch. */
     webhook::dispatch(state, &settled, event, delta).await;
-    true
+    Ok(true)
 }
 
 /// Floor and cap for the poller's failure backoff. Reuses the same
@@ -1469,10 +1552,10 @@ impl CursorRejectTracker {
 /// backs off for at least `Retry-After`, and repeated failures of any kind
 /// back off exponentially with jitter, both reset to the configured interval
 /// by the next success.
-pub async fn run_poller(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
+pub async fn run_poller(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) -> TaskExit {
     if !state.config.gateway_configured() {
         warn!("STELLAR_GATEWAY_PUBLIC is unconfigured; Horizon poller disabled");
-        return;
+        return TaskExit::DisabledByConfig("STELLAR_GATEWAY_PUBLIC is unconfigured");
     }
 
     let interval = Duration::from_secs(state.config.poll_interval_secs.max(1));
@@ -1493,7 +1576,7 @@ pub async fn run_poller(state: Arc<AppState>, mut shutdown: watch::Receiver<bool
             _ = tokio::time::sleep(next_delay) => {}
             _ = shutdown.changed() => {
                 info!("Horizon poller shutting down");
-                return;
+                return TaskExit::ShutdownRequested;
             }
         }
 
@@ -1597,10 +1680,13 @@ fn parse_sse_block(block: &str) -> SseEvent {
 /// automatically with exponential backoff, resuming from the last seen cursor
 /// so no payments are missed across a dropped connection. Idles (without
 /// connecting) while no gateway is configured.
-pub async fn run_stream_listener(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
+pub async fn run_stream_listener(
+    state: Arc<AppState>,
+    mut shutdown: watch::Receiver<bool>,
+) -> TaskExit {
     if !state.config.gateway_configured() {
         warn!("STELLAR_GATEWAY_PUBLIC is unconfigured; Horizon stream listener disabled");
-        return;
+        return TaskExit::DisabledByConfig("STELLAR_GATEWAY_PUBLIC is unconfigured");
     }
 
     info!(account = %state.config.gateway_public, "Horizon payment stream listener started");
@@ -1615,7 +1701,7 @@ pub async fn run_stream_listener(state: Arc<AppState>, mut shutdown: watch::Rece
         Ok(c) => c,
         Err(e) => {
             warn!(error = %e, "failed to build stream HTTP client; stream listener disabled");
-            return;
+            return TaskExit::Fatal(format!("failed to build stream HTTP client: {e}"));
         }
     };
 
@@ -1647,7 +1733,7 @@ pub async fn run_stream_listener(state: Arc<AppState>, mut shutdown: watch::Rece
             }
             _ = shutdown.changed() => {
                 info!("Horizon stream listener shutting down");
-                return;
+                return TaskExit::ShutdownRequested;
             }
         }
 
@@ -1659,7 +1745,7 @@ pub async fn run_stream_listener(state: Arc<AppState>, mut shutdown: watch::Rece
             _ = tokio::time::sleep(backoff) => {}
             _ = shutdown.changed() => {
                 info!("Horizon stream listener shutting down");
-                return;
+                return TaskExit::ShutdownRequested;
             }
         }
         backoff = (backoff * 2).min(max_backoff);
@@ -1808,8 +1894,15 @@ async fn handle_stream_event(state: &Arc<AppState>, block: &str, cursor: &mut St
                     .horizon_metrics
                     .record_cursor_age_secs(cursor_age_secs.max(0) as u64);
             }
+            /* No stream-side retry. A failure here leaves the poller's cursor
+            before this record, so the poller re-reads and retries it on its
+            next cycle. The stream cursor above may already be past it, which is
+            fine because the poller is the backstop (issue #978). */
             if let Err(e) = reconcile_payment(state, &hp).await {
-                warn!(error = %e, "failed to reconcile streamed payment");
+                warn!(
+                    error = %e,
+                    "failed to reconcile streamed payment; the poller will retry it"
+                );
             }
         }
         // The greeting payload (`"hello"`) and any non-record frames land here.

@@ -27,7 +27,9 @@ const USER_AGENT: &str = concat!("StellarGate/", env!("CARGO_PKG_VERSION"));
 /// configurable per-attempt timeout instead.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Fallback overall shutdown deadline when `SHUTDOWN_GRACE_SECS` is unset.
+/// Overall shutdown deadline: the process exits after this even if HTTP or
+/// background tasks are still draining, so it stays within the orchestrator's
+/// stop grace period.
 const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 30;
 
 /// Timeout for the `healthcheck` subcommand's probe request. Kept short so a
@@ -39,6 +41,11 @@ const HEALTHCHECK_DEFAULT_PATH: &str = "health";
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Load `.env` first so every setting in it is visible to the code below:
+    // `RUST_LOG` to the tracing filter (#965), and `PORT` to the `healthcheck`
+    // probe (#966). Variables already set in the process environment win.
+    dotenvy::dotenv().ok();
+
     // Handle the `healthcheck` subcommand before anything else: no config
     // loading, tracing init, DB open, migrations, Horizon calls, or port
     // binding. Container probes must not start a second server.
@@ -55,7 +62,6 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
-    dotenvy::dotenv().ok();
 
     let cfg = Config::from_env()?;
     // `open_pool` builds every connection through `db::connect_options`, which
@@ -105,44 +111,40 @@ async fn main() -> Result<()> {
     }
 
     let stream = (state.config.listener_mode == ListenerMode::Stream).then(|| {
-        supervise::supervise(
-            health.clone(),
-            "stream",
-            horizon::run_stream_listener(state.clone(), shutdown_rx.clone()),
-        )
+        supervise::supervise(health.clone(), "stream", shutdown_rx.clone(), {
+            let (state, rx) = (state.clone(), shutdown_rx.clone());
+            move || horizon::run_stream_listener(state.clone(), rx.clone())
+        })
     });
-    let poller = supervise::supervise(
-        health.clone(),
-        "poller",
-        horizon::run_poller(state.clone(), shutdown_rx.clone()),
-    );
-    let sweeper = supervise::supervise(
-        health.clone(),
-        "sweeper",
-        expiry::run_sweeper(state.clone(), shutdown_rx.clone()),
-    );
-    let retention = supervise::supervise(
-        health.clone(),
-        "retention",
-        retention::run_retention_worker(state.clone(), shutdown_rx.clone()),
-    );
-    let trustline_checker = supervise::supervise(
-        health.clone(),
-        "trustline_checker",
-        horizon::run_trustline_checker(state.clone(), shutdown_rx.clone()),
-    );
-    let redrive = supervise::supervise(
-        health.clone(),
-        "redrive",
-        webhook::run_redrive_worker(state.clone(), shutdown_rx),
-    );
+    let poller = supervise::supervise(health.clone(), "poller", shutdown_rx.clone(), {
+        let (state, rx) = (state.clone(), shutdown_rx.clone());
+        move || horizon::run_poller(state.clone(), rx.clone())
+    });
+    let sweeper = supervise::supervise(health.clone(), "sweeper", shutdown_rx.clone(), {
+        let (state, rx) = (state.clone(), shutdown_rx.clone());
+        move || expiry::run_sweeper(state.clone(), rx.clone())
+    });
+    let retention = supervise::supervise(health.clone(), "retention", shutdown_rx.clone(), {
+        let (state, rx) = (state.clone(), shutdown_rx.clone());
+        move || retention::run_retention_worker(state.clone(), rx.clone())
+    });
+    let trustline_checker =
+        supervise::supervise(health.clone(), "trustline_checker", shutdown_rx.clone(), {
+            let (state, rx) = (state.clone(), shutdown_rx.clone());
+            move || horizon::run_trustline_checker(state.clone(), rx.clone())
+        });
+    let redrive = supervise::supervise(health.clone(), "redrive", shutdown_rx.clone(), {
+        let (state, rx) = (state.clone(), shutdown_rx.clone());
+        move || webhook::run_redrive_worker(state.clone(), rx.clone())
+    });
 
-    let addr = format!("0.0.0.0:{}", state.config.port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let addr = SocketAddr::new(state.config.bind_addr, state.config.port);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
     info!("StellarGate API listening on {addr}");
 
     // One overall deadline covers both the HTTP drain and the worker drain, so
     // the process can never overrun the orchestrator's stop grace period.
+    let shutdown_grace = Duration::from_secs(DEFAULT_SHUTDOWN_GRACE_SECS);
     let deadline = tokio::time::Instant::now() + shutdown_grace;
 
     // Signal the workers at the same time as the HTTP graceful shutdown starts
@@ -178,7 +180,12 @@ async fn main() -> Result<()> {
     };
 
     if tokio::time::timeout_at(deadline, shutdown).await.is_err() {
-        let running = health.running_tasks();
+        let running: Vec<String> = health
+            .snapshots()
+            .into_iter()
+            .filter(|task| task.running)
+            .map(|task| task.name)
+            .collect();
         warn!(
             timeout_secs = shutdown_grace.as_secs(),
             ?running,
@@ -202,13 +209,17 @@ fn healthcheck_url(port: u16, path: &str) -> String {
     format!("http://127.0.0.1:{port}/{path}")
 }
 
+/// Resolve the port the `healthcheck` subcommand probes from the raw `PORT`
+/// value: the parsed port when it is a valid `u16`, otherwise the server's
+/// default of 3000.
+fn healthcheck_port(raw: Option<&str>) -> u16 {
+    raw.and_then(|p| p.parse::<u16>().ok()).unwrap_or(3000)
+}
+
 /// Probe the local server's health endpoint and return the process exit code:
 /// `0` when the endpoint answers with a success status, `1` otherwise.
 async fn run_healthcheck(path: &str) -> i32 {
-    let port = std::env::var("PORT")
-        .ok()
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(3000);
+    let port = healthcheck_port(std::env::var("PORT").ok().as_deref());
     let url = healthcheck_url(port, path);
 
     let client = match reqwest::Client::builder()
@@ -296,6 +307,22 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn healthcheck_port_uses_configured_value() {
+        assert_eq!(healthcheck_port(Some("8080")), 8080);
+    }
+
+    #[test]
+    fn healthcheck_port_defaults_to_3000_when_unset() {
+        assert_eq!(healthcheck_port(None), 3000);
+    }
+
+    #[test]
+    fn healthcheck_port_falls_back_on_unparseable_value() {
+        assert_eq!(healthcheck_port(Some("not-a-port")), 3000);
+        assert_eq!(healthcheck_port(Some("70000")), 3000);
+    }
 
     #[test]
     fn healthcheck_url_uses_port_and_path() {

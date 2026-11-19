@@ -10,6 +10,7 @@
 //! This worker prunes both on an interval, in batches so no single statement
 //! holds the write lock long enough to stall payment traffic.
 
+use crate::supervise::TaskExit;
 use crate::{AppState, db};
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,14 +32,17 @@ const MAX_PER_CYCLE: u64 = 50_000;
 /// by design. Pruning is batched housekeeping, not a correctness step, so it
 /// does not need to race startup traffic. Startup reconciliation is handled by
 /// the poller and sweeper, which run immediately.
-pub async fn run_retention_worker(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
+pub async fn run_retention_worker(
+    state: Arc<AppState>,
+    mut shutdown: watch::Receiver<bool>,
+) -> TaskExit {
     let interval = Duration::from_secs(state.config.retention_interval_secs.max(1));
 
     if state.config.webhook_delivery_retention_days <= 0
         && state.config.idempotency_retention_days <= 0
     {
         info!("retention worker disabled (both retention windows are 0)");
-        return;
+        return TaskExit::DisabledByConfig("both retention windows are 0");
     }
 
     info!(
@@ -55,7 +59,7 @@ pub async fn run_retention_worker(state: Arc<AppState>, mut shutdown: watch::Rec
             _ = tokio::time::sleep(interval) => {}
             _ = shutdown.changed() => {
                 info!("retention worker shutting down");
-                return;
+                return TaskExit::ShutdownRequested;
             }
         }
 
@@ -128,6 +132,7 @@ mod tests {
     fn test_config(delivery_days: i64, idempotency_days: i64) -> Config {
         Config {
             port: 0,
+            bind_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             database_url: "sqlite::memory:".into(),
             network: "testnet".into(),
             horizon_url: String::new(),
@@ -149,6 +154,8 @@ mod tests {
             webhook_delivery_retention_days: delivery_days,
             idempotency_retention_days: idempotency_days,
             poll_interval_secs: 10,
+            expiry_sweep_interval_secs: 10,
+            trustline_check_interval_secs: 3600,
             poll_max_pages_per_cycle: 50,
             payment_ttl_secs: 3600,
             rate_limit_requests_per_sec: 1000,
