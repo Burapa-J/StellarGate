@@ -1371,8 +1371,14 @@ mod tests {
 
     #[test]
     fn listener_mode_stream_parses() {
-        assert_eq!(ListenerMode::parse("stream").unwrap(), ListenerMode::Stream);
-        assert_eq!(ListenerMode::parse("STREAM").unwrap(), ListenerMode::Stream);
+        assert_eq!(
+            ListenerMode::parse("stream").expect("lowercase 'stream' should parse"),
+            ListenerMode::Stream
+        );
+        assert_eq!(
+            ListenerMode::parse("STREAM").expect("uppercase 'STREAM' should parse"),
+            ListenerMode::Stream
+        );
     }
 
     #[test]
