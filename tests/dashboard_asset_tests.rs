@@ -1327,3 +1327,41 @@ fn sign_out_wipes_payment_data() {
     assert!(DASHBOARD_JS.contains("loadedPayments: []"));
     assert!(DASHBOARD_JS.contains("wipePaymentData();"));
 }
+
+/// Page Visibility pauses polling and refreshes once on return (#803).
+#[test]
+fn polling_pauses_while_tab_hidden() {
+    assert!(DASHBOARD_JS.contains("document.hidden"));
+    assert!(DASHBOARD_JS.contains("visibilitychange"));
+}
+
+/// Assets carry an ETag, answer If-None-Match with 304, use `no-cache`, and
+/// vary on Accept-Encoding (#801, #802).
+#[tokio::test]
+async fn dashboard_assets_support_etag_and_vary() {
+    let server = test_server().await;
+    let res = server.get("/dashboard/app.js").await;
+    res.assert_status_ok();
+    let etag = res.header("etag").to_str().unwrap().to_string();
+    assert_eq!(res.header("cache-control"), "no-cache");
+    assert_eq!(res.header("vary"), "Accept-Encoding");
+    let res = server
+        .get("/dashboard/app.js")
+        .add_header("if-none-match", etag.as_str())
+        .await;
+    res.assert_status(axum::http::StatusCode::NOT_MODIFIED);
+    assert_eq!(res.header("etag").to_str().unwrap(), etag);
+}
+
+/// gzip is negotiated for dashboard assets (#802).
+#[tokio::test]
+async fn dashboard_assets_are_gzip_compressed() {
+    let server = test_server().await;
+    let res = server
+        .get("/dashboard/app.js")
+        .add_header("accept-encoding", "gzip")
+        .await;
+    res.assert_status_ok();
+    assert_eq!(res.header("content-encoding"), "gzip");
+    assert_eq!(res.header("vary"), "Accept-Encoding");
+}

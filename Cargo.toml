@@ -23,7 +23,7 @@ path = "src/main.rs"
 [dependencies]
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
-tower-http = { version = "0.7", features = ["cors", "trace", "limit", "request-id", "timeout", "set-header"] }
+tower-http = { version = "0.7", features = ["cors", "trace", "limit", "request-id", "timeout", "set-header", "compression-gzip", "compression-br"] }
 governor = "0.10"
 moka = { version = "0.12", features = ["sync"] }
 serde = { version = "1", features = ["derive"] }
