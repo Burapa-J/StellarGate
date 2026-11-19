@@ -275,6 +275,7 @@ All configuration is via environment variables, read once at startup. **Invalid 
 | Variable | Description | Default |
 |---|---|---|
 | `PORT` | HTTP listen port | `3000` |
+| `BIND_ADDR` | IP address the HTTP listener binds to. `127.0.0.1` keeps the API local-only (for example behind a reverse proxy on the same host); `::` listens on IPv6. An invalid value aborts boot. | `0.0.0.0` |
 | `DATABASE_URL` | sqlx connection string (not a file path) | `sqlite:stellargate.db` |
 | `STELLAR_NETWORK` | `testnet` or `public` | `testnet` |
 | `STELLAR_HORIZON_URL` | Horizon endpoint. Defaults to match `STELLAR_NETWORK`: `https://horizon.stellar.org` on `public`, `https://horizon-testnet.stellar.org` otherwise. On `public`, a testnet Horizon URL aborts boot; on `testnet`, the mainnet Horizon logs a warning (issue #969). | per `STELLAR_NETWORK` (see description) |

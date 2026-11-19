@@ -466,16 +466,17 @@
         <section class="card table-card">
           <div class="table-scroll">
           <table id="payments" class="payments" tabindex="-1" aria-label="Payments">
+            <caption id="payments-caption" class="visually-hidden">Payments: all statuses</caption>
             <thead>
               <tr>
-                <th class="select-col">
+                <th scope="col" class="select-col">
                   <input id="select-all" type="checkbox" aria-label="Select all loaded payments" />
                 </th>
-                <th>Status</th>
-                <th>Amount</th>
-                <th>Memo</th>
-                <th>Created</th>
-                <th>Payment ID</th>
+                <th scope="col">Status</th>
+                <th scope="col">Amount</th>
+                <th scope="col">Memo</th>
+                <th scope="col">Created</th>
+                <th scope="col">Payment ID</th>
               </tr>
             </thead>
             <tbody id="rows"></tbody>

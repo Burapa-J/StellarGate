@@ -22,6 +22,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 fn make_config(webhook_secret: &str, retry_attempts: u32) -> Config {
     Config {
         port: 0,
+        bind_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
         database_url: "sqlite::memory:".into(),
         network: "testnet".into(),
         horizon_url: String::new(),
