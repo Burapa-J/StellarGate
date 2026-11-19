@@ -20,6 +20,7 @@
 //! small tolerance window. See the README "Verifying webhooks" section for the
 //! verification recipe and recommended window.
 
+use crate::supervise::TaskExit;
 use crate::{AppState, db};
 // `KeyInit` provides `new_from_slice`; it moved off `Mac` in hmac 0.13.
 use hmac::{Hmac, KeyInit, Mac};
@@ -458,7 +459,10 @@ async fn redrive_one(state: &Arc<AppState>, delivery: db::WebhookDelivery) {
 /// the process shuts down. Runs one pass immediately on startup — before the
 /// first sleep — so a restart repairs any deliveries left `pending`/`failed`
 /// by the previous process without waiting a full interval.
-pub async fn run_redrive_worker(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
+pub async fn run_redrive_worker(
+    state: Arc<AppState>,
+    mut shutdown: watch::Receiver<bool>,
+) -> TaskExit {
     let interval = Duration::from_secs(state.config.webhook_redrive_interval_secs.max(1));
     info!(
         interval_secs = state.config.webhook_redrive_interval_secs,
@@ -475,7 +479,7 @@ pub async fn run_redrive_worker(state: Arc<AppState>, mut shutdown: watch::Recei
             _ = tokio::time::sleep(interval) => {}
             _ = shutdown.changed() => {
                 info!("webhook redrive worker shutting down");
-                return;
+                return TaskExit::ShutdownRequested;
             }
         }
     }
@@ -719,8 +723,7 @@ mod tests {
             // Confirm the serialised bytes contain the event string, i.e. that
             // it survives the round-trip through serde_json::to_vec used in dispatch().
             let body = serde_json::to_vec(&payload).unwrap();
-            let body_str =
-                String::from_utf8(body).expect("webhook body should be valid UTF-8");
+            let body_str = String::from_utf8(body).expect("webhook body should be valid UTF-8");
             assert!(
                 body_str.contains(event),
                 "serialised body must contain the event string (event={event})"
