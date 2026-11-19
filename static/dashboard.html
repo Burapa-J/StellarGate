@@ -122,9 +122,11 @@
           type="password"
           placeholder="merchant API key"
           data-i18n-placeholder="gate.apiKeyPlaceholder"
+          autocomplete="off"
           spellcheck="false"
           required
         />
+        <button id="api-key-toggle" type="button" class="ghost" aria-pressed="false" aria-controls="api-key">Show</button>
         <label class="checkbox">
           <input id="remember" type="checkbox" />
           <span data-i18n="gate.remember">Keep me signed in on this device</span>
@@ -309,6 +311,13 @@
             <button class="ghost preset" type="button" data-days="7" aria-pressed="false">Last 7 days</button>
             <button class="ghost preset" type="button" data-days="30" aria-pressed="false">Last 30 days</button>
           </div>
+          <div class="filters" role="group" aria-label="Filter by amount">
+            <label class="small" for="min-amount">Min amount</label>
+            <input id="min-amount" type="text" inputmode="decimal" autocomplete="off" placeholder="0" />
+            <label class="small" for="max-amount">Max amount</label>
+            <input id="max-amount" type="text" inputmode="decimal" autocomplete="off" placeholder="any" />
+            <span id="amount-filter-note" class="muted small" hidden>Filters loaded rows only</span>
+          </div>
           <label class="small checkbox" for="auto-refresh">
             <input id="auto-refresh" type="checkbox" />
             <span>Auto-refresh</span>
@@ -387,6 +396,11 @@
         <p id="rate-limit" class="error" role="status" hidden></p>
 
         <section id="summary" class="summary" aria-label="Payment summary"></section>
+        <section id="asset-totals" class="summary" aria-label="Completed total per asset"></section>
+        <div id="idle-warning" class="card" role="alertdialog" aria-live="assertive" hidden>
+          <span>You will be signed out in 60 seconds due to inactivity.</span>
+          <button id="idle-stay" type="button" class="primary">Stay signed in</button>
+        </div>
 
         <!-- Admin: API keys for a merchant. Operators can list existing keys
              (id, prefix, created, revoked) and issue or revoke keys. Full key
@@ -500,6 +514,8 @@
       >
         <div class="detail-head">
           <h2 id="detail-title">Payment</h2>
+          <button id="detail-prev" type="button" class="ghost" aria-label="Previous payment (k)" title="Previous (k)">&larr; Prev</button>
+          <button id="detail-next" type="button" class="ghost" aria-label="Next payment (j)" title="Next (j)">Next &rarr;</button>
           <button id="detail-close" class="ghost" aria-label="Close">&times;</button>
         </div>
         <button id="invoice-print" type="button" class="primary" disabled>Print invoice</button>
@@ -510,7 +526,20 @@
             <div id="invoice-qr" aria-hidden="true"></div>
             <p id="invoice-uri" class="mono"></p>
           </section>
+          <section id="detail-shortfall" aria-label="Underpayment" hidden>
+            <h3>Underpaid</h3>
+            <dl id="shortfall-fields" class="fields"></dl>
+            <p class="muted small">Payments sent as several operations are summed; see
+              <a href="https://github.com/StellarGateLabs/StellarGate/blob/main/WEBHOOK_REFERENCE.md" target="_blank" rel="noopener noreferrer">the multi-op credit behaviour</a>.</p>
+          </section>
           <dl id="detail-fields" class="fields"></dl>
+          <h3>Timeline</h3>
+          <ol id="detail-timeline" class="timeline"></ol>
+          <details id="detail-raw" class="raw-json">
+            <summary>View raw JSON</summary>
+            <button id="detail-raw-copy" type="button" class="ghost copy">Copy</button>
+            <pre id="detail-raw-body" class="mono"></pre>
+          </details>
 
         <h3>Webhook deliveries</h3>
         <p id="deliveries-empty" class="muted small" hidden>

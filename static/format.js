@@ -27,10 +27,112 @@ export const EXPLORER_TX_BASE =
  * "Invalid Date": the raw string is far more useful to an operator debugging a
  * bad `expires_at` than the browser's own error text.
  */
-export function fmtTime(iso) {
+export function fmtTime(iso, zone) {
   if (!iso) return EMPTY;
   var d = new Date(iso);
-  return isNaN(d.getTime()) ? iso : d.toLocaleString();
+  if (isNaN(d.getTime())) return iso;
+  if (zone === "utc") {
+    return d.toLocaleString(undefined, { timeZone: "UTC" }) + " UTC";
+  }
+  if (zone === "local") {
+    return d.toLocaleString(undefined, { timeZoneName: "short" });
+  }
+  return d.toLocaleString();
+}
+
+/**
+ * ISO-8601 instant rendered in `zone` for the CSV export (#783): "utc" gives a
+ * `Z` suffix, anything else a local time with an explicit +hh:mm offset. An
+ * absent or unparseable value is returned unchanged.
+ */
+export function isoInZone(iso, zone) {
+  if (!iso) return iso;
+  var d = new Date(iso);
+  if (isNaN(d.getTime())) return iso;
+  if (zone !== "local") return d.toISOString().replace(/\.\d{3}Z$/, "Z");
+  function pad(n) { return (n < 10 ? "0" : "") + n; }
+  var off = -d.getTimezoneOffset();
+  var sign = off < 0 ? "-" : "+";
+  off = Math.abs(off);
+  return (
+    d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) +
+    "T" + pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds()) +
+    sign + pad(Math.floor(off / 60)) + ":" + pad(off % 60)
+  );
+}
+
+/**
+ * Locale-aware amount for display (#784). Fraction digits are capped at the
+ * Stellar precision of 7 and trailing zeros are dropped, matching
+ * `formatAmount`. The decimal *string* is handed to Intl so no float rounding
+ * is introduced. CSV and URIs must keep using the locale-neutral helpers.
+ */
+export function formatAmountLocale(amount, asset, locale) {
+  var s = String(amount === undefined || amount === null ? "" : amount).trim();
+  if (!/^-?\d+(\.\d+)?$/.test(s)) return formatAmount(amount, asset);
+  var out;
+  try {
+    out = new Intl.NumberFormat(locale || undefined, {
+      minimumFractionDigits: 0,
+      maximumFractionDigits: 7,
+    }).format(s);
+  } catch (e) {
+    return formatAmount(amount, asset);
+  }
+  return out + " " + asset;
+}
+
+/**
+ * Compare two non-negative/negative decimal strings exactly (#782), without
+ * converting to Number. Returns -1, 0, 1, or NaN if either is not a decimal.
+ */
+export function compareDecimal(a, b) {
+  var re = /^(-?)(\d*)(?:\.(\d*))?$/;
+  var x = re.exec(String(a).trim());
+  var y = re.exec(String(b).trim());
+  if (!x || !y || (!x[2] && !x[3]) || (!y[2] && !y[3])) return NaN;
+  function parts(m) {
+    var int = (m[2] || "").replace(/^0+/, "");
+    var frac = (m[3] || "").replace(/0+$/, "");
+    var zero = !int && !frac;
+    return { neg: m[1] === "-" && !zero, int: int, frac: frac };
+  }
+  var p = parts(x), q = parts(y);
+  if (p.neg !== q.neg) return p.neg ? -1 : 1;
+  var sign = p.neg ? -1 : 1;
+  if (p.int.length !== q.int.length) return (p.int.length < q.int.length ? -1 : 1) * sign;
+  if (p.int !== q.int) return (p.int < q.int ? -1 : 1) * sign;
+  var n = Math.max(p.frac.length, q.frac.length);
+  var pf = p.frac.padEnd(n, "0"), qf = q.frac.padEnd(n, "0");
+  if (pf === qf) return 0;
+  return (pf < qf ? -1 : 1) * sign;
+}
+
+/**
+ * Keep payments whose amount lies in [min, max] (#782). A blank or invalid
+ * bound is ignored. Filters the loaded rows; the list API has no amount filter.
+ */
+export function filterByAmount(payments, min, max) {
+  var lo = String(min || "").trim();
+  var hi = String(max || "").trim();
+  var hasLo = lo !== "" && !isNaN(compareDecimal(lo, "0"));
+  var hasHi = hi !== "" && !isNaN(compareDecimal(hi, "0"));
+  if (!hasLo && !hasHi) return payments || [];
+  return (payments || []).filter(function (p) {
+    var amt = p && p.amount;
+    if (hasLo && !(compareDecimal(amt, lo) >= 0)) return false;
+    if (hasHi && !(compareDecimal(amt, hi) <= 0)) return false;
+    return true;
+  });
+}
+
+/** Ids in `payments` that are not in the `seen` set (#781). */
+export function newPaymentIds(seen, payments) {
+  var out = [];
+  (payments || []).forEach(function (p) {
+    if (p && p.id && !seen[p.id]) out.push(p.id);
+  });
+  return out;
 }
 
 /**
@@ -159,14 +261,18 @@ export function csvField(value) {
 }
 
 /** Serialise loaded payments to a CSV document, header row first. */
-export function toCsv(payments, columns) {
+export function toCsv(payments, columns, zone) {
   var cols = columns || CSV_COLUMNS;
   var lines = [cols.map(csvField).join(",")];
   (payments || []).forEach(function (p) {
     lines.push(
       cols
         .map(function (key) {
-          return csvField(p ? p[key] : "");
+          var v = p ? p[key] : "";
+          if (zone && (key === "created_at" || key === "expires_at")) {
+            v = isoInZone(v, zone);
+          }
+          return csvField(v);
         })
         .join(",")
     );
