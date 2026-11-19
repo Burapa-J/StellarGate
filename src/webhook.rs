@@ -78,6 +78,20 @@ pub fn sign(secret: &str, timestamp: i64, body: &[u8]) -> String {
     hex::encode(mac.finalize().into_bytes())
 }
 
+/// Check a webhook signature produced by [`sign`] for the given timestamp and
+/// body, in constant time over the hex digests. Receivers do the same check.
+pub fn verify_signature(secret: &str, timestamp: i64, body: &[u8], signature: &str) -> bool {
+    let expected = sign(secret, timestamp, body);
+    if expected.is_empty() || expected.len() != signature.len() {
+        return false;
+    }
+    expected
+        .bytes()
+        .zip(signature.bytes())
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
+}
+
 /// Current Unix time in seconds, used as the webhook signing timestamp.
 pub(crate) fn current_timestamp() -> i64 {
     SystemTime::now()

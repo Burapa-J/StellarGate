@@ -14,7 +14,9 @@ use stellargate::{
     metrics::{
         AuthMetrics, HorizonMetrics, HttpMetrics, PaymentMetrics, TrustlineMetrics, WebhookMetrics,
     },
-    retention, supervise, webhook,
+    retention,
+    supervise::{self, TaskExit},
+    webhook,
 };
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -105,41 +107,72 @@ async fn main() -> Result<()> {
     }
 
     let stream = (state.config.listener_mode == ListenerMode::Stream).then(|| {
-        supervise::supervise(
-            health.clone(),
-            "stream",
-            horizon::run_stream_listener(state.clone(), shutdown_rx.clone()),
-        )
+        spawn_worker(&health, "stream", &shutdown_rx, {
+            let state = state.clone();
+            move |rx| {
+                let state = state.clone();
+                async move {
+                    horizon::run_stream_listener(state, rx).await;
+                    TaskExit::ShutdownRequested
+                }
+            }
+        })
     });
-    let poller = supervise::supervise(
-        health.clone(),
-        "poller",
-        horizon::run_poller(state.clone(), shutdown_rx.clone()),
-    );
-    let sweeper = supervise::supervise(
-        health.clone(),
-        "sweeper",
-        expiry::run_sweeper(state.clone(), shutdown_rx.clone()),
-    );
-    let retention = supervise::supervise(
-        health.clone(),
-        "retention",
-        retention::run_retention_worker(state.clone(), shutdown_rx.clone()),
-    );
-    let trustline_checker = supervise::supervise(
-        health.clone(),
-        "trustline_checker",
-        horizon::run_trustline_checker(state.clone(), shutdown_rx.clone()),
-    );
-    let redrive = supervise::supervise(
-        health.clone(),
-        "redrive",
-        webhook::run_redrive_worker(state.clone(), shutdown_rx),
-    );
+    let poller = spawn_worker(&health, "poller", &shutdown_rx, {
+        let state = state.clone();
+        move |rx| {
+            let state = state.clone();
+            async move {
+                horizon::run_poller(state, rx).await;
+                TaskExit::ShutdownRequested
+            }
+        }
+    });
+    let sweeper = spawn_worker(&health, "sweeper", &shutdown_rx, {
+        let state = state.clone();
+        move |rx| {
+            let state = state.clone();
+            async move {
+                expiry::run_sweeper(state, rx).await;
+                TaskExit::ShutdownRequested
+            }
+        }
+    });
+    let retention = spawn_worker(&health, "retention", &shutdown_rx, {
+        let state = state.clone();
+        move |rx| {
+            let state = state.clone();
+            async move {
+                retention::run_retention_worker(state, rx).await;
+                TaskExit::ShutdownRequested
+            }
+        }
+    });
+    let trustline_checker = spawn_worker(&health, "trustline_checker", &shutdown_rx, {
+        let state = state.clone();
+        move |rx| horizon::run_trustline_checker(state.clone(), rx)
+    });
+    let redrive = spawn_worker(&health, "redrive", &shutdown_rx, {
+        let state = state.clone();
+        move |rx| {
+            let state = state.clone();
+            async move {
+                webhook::run_redrive_worker(state, rx).await;
+                TaskExit::ShutdownRequested
+            }
+        }
+    });
 
     let addr = format!("0.0.0.0:{}", state.config.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("StellarGate API listening on {addr}");
+
+    let shutdown_grace = Duration::from_secs(
+        std::env::var("SHUTDOWN_GRACE_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_SHUTDOWN_GRACE_SECS),
+    );
 
     // One overall deadline covers both the HTTP drain and the worker drain, so
     // the process can never overrun the orchestrator's stop grace period.
@@ -234,6 +267,24 @@ async fn run_healthcheck(path: &str) -> i32 {
             1
         }
     }
+}
+
+/// Run a background worker under the supervisor. `run` is called again on
+/// every restart, so it receives a fresh shutdown receiver each time.
+fn spawn_worker<F, Fut>(
+    health: &TaskHealth,
+    name: &'static str,
+    shutdown: &watch::Receiver<bool>,
+    mut run: F,
+) -> JoinHandle<()>
+where
+    F: FnMut(watch::Receiver<bool>) -> Fut + Send + 'static,
+    Fut: Future<Output = TaskExit> + Send + 'static,
+{
+    let rx = shutdown.clone();
+    supervise::supervise(health.clone(), name, shutdown.clone(), move || {
+        run(rx.clone())
+    })
 }
 
 fn http_client(timeout: Duration) -> Result<reqwest::Client> {

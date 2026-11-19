@@ -176,7 +176,6 @@ fn is_teredo(ip: Ipv6Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn blocks_loopback_link_local_and_private_v4() {

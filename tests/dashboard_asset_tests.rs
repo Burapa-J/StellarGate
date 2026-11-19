@@ -25,7 +25,6 @@ const DASHBOARD_CSS: &str = include_str!("../static/dashboard.css");
 const DASHBOARD_JS: &str = include_str!("../static/dashboard.js");
 const DASHBOARD_THEME_JS: &str = include_str!("../static/dashboard-theme.js");
 
-const DASHBOARD_FORMAT_JS: &str = include_str!("../static/dashboard-format.js");
 
 const DASHBOARD_STATE_JS: &str = include_str!("../static/state.js");
 
