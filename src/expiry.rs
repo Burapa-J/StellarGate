@@ -18,12 +18,17 @@ use tracing::{debug, info, warn};
 /// The webhook event emitted when an intent is swept to `expired`.
 const EXPIRED_EVENT: &str = "payment.expired";
 
+/// How many overdue intents one sweep statement expires at most. Bounds the
+/// rows held in memory (and the webhooks fired) per batch while a backlog
+/// drains (issue #885).
+const EXPIRY_BATCH_SIZE: i64 = 500;
+
 /// Run one sweep: expire overdue pending intents in bounded batches until a
 /// short batch comes back, firing each expired intent's webhook. Returns how
 /// many intents were expired. Safe to call repeatedly — an intent is
 /// transitioned at most once.
 pub async fn sweep_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
-    let batch_size = state.config.expiry_batch_size.max(1) as i64;
+    let batch_size = EXPIRY_BATCH_SIZE;
     let mut total = 0usize;
     loop {
         let expired = db::expire_overdue(&state.pool, batch_size).await?;

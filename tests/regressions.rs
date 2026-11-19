@@ -9,18 +9,93 @@
 //! If a test here starts failing, the fix it guards has regressed — do not
 //! delete the test, restore the fix.
 
+use std::str::FromStr;
+use std::sync::Arc;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use stellargate::{
+    AppState,
+    api::router,
+    config::{AcceptedAsset, Config, ListenerMode},
+    db,
+    metrics::{
+        AuthMetrics, HorizonMetrics, HttpMetrics, PaymentMetrics, TrustlineMetrics, WebhookMetrics,
+    },
+};
 use tower::ServiceExt;
+use uuid::Uuid;
 
-/// Build the application router under test.
+/// Build the application router under test, backed by a fresh in-memory
+/// database.
 ///
 /// Kept in one place so the guard file stays black-box: tests only ever touch
-/// the public HTTP surface.
+/// the public HTTP surface. The shared-cache DSN keeps every pooled connection
+/// on the same database.
 async fn app() -> axum::Router {
-    // The router is constructed the same way the binary does it. If the
-    // constructor signature changes, only this helper needs updating.
-    crate::app_router_for_tests().await
+    let dsn = format!("sqlite:file:{}?mode=memory&cache=shared", Uuid::new_v4());
+    let pool = SqlitePoolOptions::new()
+        .min_connections(1)
+        .connect_with(SqliteConnectOptions::from_str(&dsn).unwrap())
+        .await
+        .unwrap();
+    db::migrate(&pool).await.unwrap();
+
+    let config = Config {
+        port: 0,
+        database_url: dsn,
+        network: "testnet".into(),
+        horizon_url: String::new(),
+        gateway_public: "UNCONFIGURED".into(),
+        accepted_assets: vec![AcceptedAsset {
+            code: "XLM".into(),
+            issuer: None,
+        }],
+        webhook_secret: String::new(),
+        webhook_retry_attempts: 1,
+        webhook_retry_delay_ms: 0,
+        webhook_retry_max_delay_ms: 60_000,
+        allowed_webhook_schemes: vec!["https".into(), "http".into()],
+        webhook_timeout_secs: 10,
+        webhook_redrive_interval_secs: 30,
+        webhook_redrive_concurrency: 4,
+        webhook_redrive_max_attempts: 8,
+        webhook_redrive_grace_secs: 60,
+        webhook_redrive_backoff_initial_secs: 0,
+        webhook_redrive_backoff_max_secs: 0,
+        retention_interval_secs: 3600,
+        webhook_delivery_retention_days: 30,
+        idempotency_retention_days: 7,
+        poll_interval_secs: 10,
+        poll_max_pages_per_cycle: 50,
+        payment_ttl_secs: 3600,
+        rate_limit_requests_per_sec: 10_000,
+        db_pool_max_connections: 5,
+        db_busy_timeout_ms: 5000,
+        cors_allowed_origins: vec![],
+        listener_mode: ListenerMode::Poll,
+        webhook_allow_private_targets: false,
+        admin_provisioning_secret: "test-admin-secret".into(),
+        metrics_token: String::new(),
+        request_timeout_secs: 30,
+        stream_idle_timeout_secs: 30,
+        trusted_proxy_cidrs: vec![],
+    };
+
+    router(Arc::new(AppState {
+        pool,
+        config,
+        http: reqwest::Client::new(),
+        webhook_http: reqwest::Client::new(),
+        webhook_metrics: WebhookMetrics::new(),
+        auth_metrics: AuthMetrics::new(),
+        horizon_metrics: HorizonMetrics::new(),
+        trustline_metrics: TrustlineMetrics::new(),
+        http_metrics: HttpMetrics::new(),
+        payment_metrics: PaymentMetrics::new(),
+        task_health: stellargate::TaskHealth::new(),
+    }))
 }
 
 /// Send a request through the router and return the response status.

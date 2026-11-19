@@ -159,11 +159,6 @@ fn make_half_payment(operation_index: i64) -> HorizonPayment {
     let paging_token = format!("12884901985-{operation_index}-abc123def456");
     HorizonPayment {
         kind: "payment".into(),
-        // Added by #614/#615: the dedup key is (payment_id, tx_hash,
-        // operation_index), so a multi-op transaction credits each operation
-        // independently. Absent from a real response only on pre-protocol-10
-        // Horizon, where it defaults to 0.
-        operation_index: 0,
         amount: Some("5.0000000".into()),
         asset_type: Some("native".into()),
         asset_code: None,
@@ -248,7 +243,7 @@ async fn multi_op_same_tx_credits_full_amount() {
     // `reconcile_payment` returns whether it *updated the row*, not whether the
     // intent reached `completed`; the underpayment transition is an update, so
     // it returns true. The resulting status is the assertion that matters.
-    reconcile_payment(&state, &op0)
+    let settled0 = reconcile_payment(&state, &op0)
         .await
         .expect("op0 reconcile must not error");
     /* The returned bool means "a settlement webhook was dispatched", not "the
@@ -292,6 +287,7 @@ async fn multi_op_same_tx_credits_full_amount() {
     // and `payment.completed` for the second. Two operations, two state
     // transitions, two notifications — and no third from a re-credit.
     tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+    let received = mock_server.received_requests().await.unwrap();
     assert_eq!(
         received.len(),
         2,
@@ -356,6 +352,7 @@ async fn multi_op_idempotent_on_rescan() {
         after_first_pass, 2,
         "expected one payment.underpaid and one payment.completed webhook; got {after_first_pass}"
     );
+    let first_pass = delivered_events(&mock_server).await;
 
     // Second pass: rescan with the same operations.
     reconcile_payment(&state, &op0).await.unwrap();
@@ -420,11 +417,6 @@ async fn single_op_tx_still_works() {
 
     let hp = HorizonPayment {
         kind: "payment".into(),
-        // Added by #614/#615: the dedup key is (payment_id, tx_hash,
-        // operation_index), so a multi-op transaction credits each operation
-        // independently. Absent from a real response only on pre-protocol-10
-        // Horizon, where it defaults to 0.
-        operation_index: 0,
         amount: Some("10.0000000".into()),
         asset_type: Some("native".into()),
         asset_code: None,

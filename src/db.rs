@@ -778,15 +778,20 @@ pub async fn list_pending(pool: &Db) -> Result<Vec<Payment>> {
 /// returning the rows that were swept so the caller can fire `payment.expired`
 /// webhooks. Each row is updated with a guard on a watchable status so a payment
 /// that settles concurrently is left untouched and not double-reported.
-pub async fn expire_overdue(pool: &Db) -> Result<Vec<Payment>> {
+///
+/// At most `limit` overdue rows are swept per call, so the sweeper works through
+/// a backlog in bounded batches instead of loading every overdue row at once.
+pub async fn expire_overdue(pool: &Db, limit: i64) -> Result<Vec<Payment>> {
     let overdue = sqlx::query(
         "SELECT id, merchant_id, destination_address, memo, amount, asset, asset_issuer, status,
                 webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
          FROM payments
          WHERE status IN ('pending', 'underpaid')
            AND expires_at <= strftime('%Y-%m-%dT%H:%M:%SZ','now')
-         ORDER BY created_at ASC",
+         ORDER BY created_at ASC
+         LIMIT ?",
     )
+    .bind(limit)
     .fetch_all(pool)
     .await?;
 
@@ -1812,7 +1817,7 @@ mod tests {
                 .is_none()
         );
 
-        let expired = expire_overdue(&pool).await.unwrap();
+        let expired = expire_overdue(&pool, 1000).await.unwrap();
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].id, "partial-dead");
         assert_eq!(expired[0].status, "expired");
@@ -1829,7 +1834,7 @@ mod tests {
             .unwrap();
 
         // First sweep expires exactly the overdue intent and returns it.
-        let expired = expire_overdue(&pool).await.unwrap();
+        let expired = expire_overdue(&pool, 1000).await.unwrap();
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].id, "dead");
         assert_eq!(expired[0].status, "expired");
@@ -1844,7 +1849,7 @@ mod tests {
         );
 
         // A second sweep is a no-op — nothing is double-reported.
-        assert_eq!(expire_overdue(&pool).await.unwrap().len(), 0);
+        assert_eq!(expire_overdue(&pool, 1000).await.unwrap().len(), 0);
     }
 
     #[tokio::test]

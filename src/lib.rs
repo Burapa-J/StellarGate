@@ -282,6 +282,30 @@ impl TaskHealth {
         self.inner.stopped.load(Ordering::Relaxed)
     }
 
+    /// Names of the tasks currently running, for the shutdown-deadline log.
+    pub fn running_tasks(&self) -> Vec<&'static str> {
+        let tasks = self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        let mut running: Vec<&'static str> = tasks
+            .iter()
+            .filter(|(_, s)| s.running)
+            .map(|(name, _)| *name)
+            .collect();
+        running.sort_unstable();
+        running
+    }
+
+    /// Supervisor-triggered restarts recorded for `name`; `0` if unknown.
+    pub fn restarts(&self, name: &str) -> u64 {
+        let tasks = self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        tasks.get(name).map_or(0, |s| s.restarts)
+    }
+
+    /// Why `name` is disabled by configuration, if it is.
+    pub fn disabled_reason(&self, name: &str) -> Option<&'static str> {
+        let tasks = self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        tasks.get(name).and_then(|s| s.disabled_reason)
+    }
+
     /// Snapshot of every known task, for `/metrics`.
     pub fn snapshots(&self) -> Vec<TaskSnapshot> {
         let required = self.inner.required.lock().unwrap_or_else(|e| e.into_inner());
@@ -309,10 +333,80 @@ impl TaskHealth {
             )
             .collect()
     }
+
+    /// How many required tasks are not disabled by configuration. Used by
+    /// Prometheus: `stellargate_tasks_expected`.
+    pub fn expected_tasks(&self) -> u64 {
+        let required = self.inner.required.lock().unwrap_or_else(|e| e.into_inner());
+        let tasks = self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        required
+            .iter()
+            .filter(|name| {
+                tasks
+                    .get(*name)
+                    .map(|s| s.disabled_reason.is_none())
+                    .unwrap_or(true)
+            })
+            .count() as u64
+    }
+
+    /// How many required, non-disabled tasks are currently running. Used by
+    /// Prometheus: `stellargate_tasks_live`.
+    pub fn live_tasks(&self) -> u64 {
+        let required = self.inner.required.lock().unwrap_or_else(|e| e.into_inner());
+        let tasks = self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        required
+            .iter()
+            .filter(|name| {
+                tasks
+                    .get(*name)
+                    .map(|s| s.running && s.disabled_reason.is_none())
+                    .unwrap_or(false)
+            })
+            .count() as u64
+    }
 }
 
 impl Default for TaskHealth {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Shared application state handed to every request handler and the background
+/// Horizon poller. Cloning is cheap — the pool and HTTP client are internally
+/// reference-counted.
+pub struct AppState {
+    pub pool: db::Db,
+    pub config: config::Config,
+    pub http: reqwest::Client,
+    pub webhook_http: reqwest::Client,
+    /// Webhook delivery metrics: delivered/failed/retried counts and a latency
+    /// histogram. Exposed via `GET /metrics` so operators can see delivery
+    /// success rate, retry volume, and failure spikes at a glance.
+    pub webhook_metrics: metrics::WebhookMetrics,
+    /// Auth middleware outcome counters: success/failure (by reason) counts.
+    /// Exposed via `GET /metrics` so credential-stuffing or misconfigured
+    /// clients are visible without grepping logs.
+    pub auth_metrics: metrics::AuthMetrics,
+    /// Horizon reconciliation counters: currently records skipped for having no
+    /// usable transaction hash, so an unexpected Horizon payload is visible in
+    /// `GET /metrics` and not only in the logs.
+    pub horizon_metrics: metrics::HorizonMetrics,
+    /// Per-asset gateway trustline state, refreshed at boot and on a
+    /// recurring interval thereafter (trustlines can be revoked, or an asset
+    /// added to `ACCEPTED_ASSETS`, at any time after boot). Exposed via
+    /// `GET /metrics` and consulted by `POST /payments` to reject intents in
+    /// an asset currently confirmed unpayable.
+    pub trustline_metrics: metrics::TrustlineMetrics,
+    /// HTTP request counters and latency histogram, labelled by matched route
+    /// and method. Exposed via `GET /metrics` so traffic volume and latency
+    /// are queryable facts rather than invisible to an operator.
+    pub http_metrics: metrics::HttpMetrics,
+    /// Payment lifecycle counters and settlement-latency histogram. Exposed
+    /// via `GET /metrics`.
+    pub payment_metrics: metrics::PaymentMetrics,
+    /// Background task health: tracks started, stopped, and failed task counts
+    /// for monitoring and alerting.
+    pub task_health: TaskHealth,
 }

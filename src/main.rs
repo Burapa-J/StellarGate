@@ -58,6 +58,7 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
 
     let cfg = Config::from_env()?;
+    let shutdown_grace = shutdown_grace();
     // `open_pool` builds every connection through `db::connect_options`, which
     // enables `PRAGMA foreign_keys = ON`, so referential integrity is enforced
     // on each pooled connection without any extra setup here.
@@ -104,38 +105,44 @@ async fn main() -> Result<()> {
         health.require("stream");
     }
 
+    // Each worker is supervised from a factory, so a panic or unexpected return
+    // restarts it with fresh clones of its arguments.
     let stream = (state.config.listener_mode == ListenerMode::Stream).then(|| {
-        supervise::supervise(
-            health.clone(),
-            "stream",
-            horizon::run_stream_listener(state.clone(), shutdown_rx.clone()),
-        )
+        let (st, rx) = (state.clone(), shutdown_rx.clone());
+        supervise::supervise(health.clone(), "stream", shutdown_rx.clone(), move || {
+            worker_exit(horizon::run_stream_listener(st.clone(), rx.clone()), rx.clone())
+        })
     });
-    let poller = supervise::supervise(
-        health.clone(),
-        "poller",
-        horizon::run_poller(state.clone(), shutdown_rx.clone()),
-    );
-    let sweeper = supervise::supervise(
-        health.clone(),
-        "sweeper",
-        expiry::run_sweeper(state.clone(), shutdown_rx.clone()),
-    );
-    let retention = supervise::supervise(
-        health.clone(),
-        "retention",
-        retention::run_retention_worker(state.clone(), shutdown_rx.clone()),
-    );
-    let trustline_checker = supervise::supervise(
-        health.clone(),
-        "trustline_checker",
-        horizon::run_trustline_checker(state.clone(), shutdown_rx.clone()),
-    );
-    let redrive = supervise::supervise(
-        health.clone(),
-        "redrive",
-        webhook::run_redrive_worker(state.clone(), shutdown_rx),
-    );
+    let poller = {
+        let (st, rx) = (state.clone(), shutdown_rx.clone());
+        supervise::supervise(health.clone(), "poller", shutdown_rx.clone(), move || {
+            worker_exit(horizon::run_poller(st.clone(), rx.clone()), rx.clone())
+        })
+    };
+    let sweeper = {
+        let (st, rx) = (state.clone(), shutdown_rx.clone());
+        supervise::supervise(health.clone(), "sweeper", shutdown_rx.clone(), move || {
+            worker_exit(expiry::run_sweeper(st.clone(), rx.clone()), rx.clone())
+        })
+    };
+    let retention = {
+        let (st, rx) = (state.clone(), shutdown_rx.clone());
+        supervise::supervise(health.clone(), "retention", shutdown_rx.clone(), move || {
+            worker_exit(retention::run_retention_worker(st.clone(), rx.clone()), rx.clone())
+        })
+    };
+    let trustline_checker = {
+        let (st, rx) = (state.clone(), shutdown_rx.clone());
+        supervise::supervise(health.clone(), "trustline_checker", shutdown_rx.clone(), move || {
+            horizon::run_trustline_checker(st.clone(), rx.clone())
+        })
+    };
+    let redrive = {
+        let (st, rx) = (state.clone(), shutdown_rx.clone());
+        supervise::supervise(health.clone(), "redrive", shutdown_rx.clone(), move || {
+            worker_exit(webhook::run_redrive_worker(st.clone(), rx.clone()), rx.clone())
+        })
+    };
 
     let addr = format!("0.0.0.0:{}", state.config.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -188,6 +195,33 @@ async fn main() -> Result<()> {
 
     info!("shutdown complete");
     Ok(())
+}
+
+/// Adapt a worker future (which resolves to `()`) to the supervisor's
+/// contract. A return after shutdown was requested is ordinary; any other
+/// return is unexpected, so it is reported as `Fatal` and restarted.
+async fn worker_exit(
+    worker: impl Future<Output = ()>,
+    shutdown: watch::Receiver<bool>,
+) -> stellargate::supervise::TaskExit {
+    worker.await;
+    if *shutdown.borrow() {
+        stellargate::supervise::TaskExit::ShutdownRequested
+    } else {
+        stellargate::supervise::TaskExit::Fatal("worker returned before shutdown".to_string())
+    }
+}
+
+/// Overall shutdown deadline, read from `SHUTDOWN_GRACE_SECS` (falling back to
+/// [`DEFAULT_SHUTDOWN_GRACE_SECS`]). The orchestrator's stop grace period must
+/// exceed this value.
+fn shutdown_grace() -> Duration {
+    let secs = std::env::var("SHUTDOWN_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(DEFAULT_SHUTDOWN_GRACE_SECS);
+    Duration::from_secs(secs)
 }
 
 /// Build the probe URL for the `healthcheck` subcommand. Trims any leading

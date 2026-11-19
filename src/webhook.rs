@@ -78,6 +78,24 @@ pub fn sign(secret: &str, timestamp: i64, body: &[u8]) -> String {
     hex::encode(mac.finalize().into_bytes())
 }
 
+/// Receiver-side check: is `signature` (hex) the HMAC-SHA256 of
+/// `"{timestamp}.{body}"` under `secret`?
+///
+/// The comparison is constant-time (`verify_slice`), so a mismatch leaks no
+/// prefix of the expected MAC. Freshness of `timestamp` is the caller's job.
+pub fn verify_signature(secret: &str, timestamp: i64, body: &[u8], signature: &str) -> bool {
+    let Ok(expected) = hex::decode(signature) else {
+        return false;
+    };
+    let Ok(mut mac) = HmacSha256::new_from_slice(secret.as_bytes()) else {
+        return false;
+    };
+    mac.update(timestamp.to_string().as_bytes());
+    mac.update(b".");
+    mac.update(body);
+    mac.verify_slice(&expected).is_ok()
+}
+
 /// Current Unix time in seconds, used as the webhook signing timestamp.
 pub(crate) fn current_timestamp() -> i64 {
     SystemTime::now()
