@@ -1088,14 +1088,28 @@ pub async fn poll_once(
         .await?;
         let count = page.len();
 
+        /* Walk the page in order and advance the in-memory cursor only past
+        records that reconciled. On the first failure, stop: the cursor stays
+        on the last good record, so the checkpoint below never skips the failed
+        payment and the next cycle re-reads it (issue #978). Re-processing the
+        records already handled is safe: `processed_transactions` dedups them. */
+        let mut reconcile_failure = None;
         for hp in &page {
-            if let Some(token) = &hp.paging_token {
-                cursor = token.clone();
-            }
             match reconcile_payment(state, hp).await {
                 Ok(true) => settled += 1,
                 Ok(false) => {}
-                Err(e) => warn!(error = %e, "failed to reconcile polled payment"),
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        paging_token = ?hp.paging_token,
+                        "failed to reconcile polled payment; holding the cursor before it"
+                    );
+                    reconcile_failure = Some(e);
+                    break;
+                }
+            }
+            if let Some(token) = &hp.paging_token {
+                cursor = token.clone();
             }
         }
 
@@ -1111,6 +1125,12 @@ pub async fn poll_once(
         cursor still points at the last fully-processed page, and re-reading
         the unfinished page is harmless (settled intents are skipped). */
         db::set_state(&state.pool, PAYMENT_CURSOR_KEY, &cursor).await?;
+
+        /* Surface the failure after the checkpoint, so the poller's backoff
+        applies and the retry starts from the last good record. */
+        if let Some(e) = reconcile_failure {
+            return Err(e.context("poll cycle stopped at a payment that failed to reconcile"));
+        }
 
         // A short page means Horizon has nothing newer — we're caught up.
         if count < PAGE_LIMIT as usize {
@@ -1215,7 +1235,13 @@ async fn reconcile_active_payment(
         .and_then(money::parse_stroops)
         .unwrap_or(0);
     let op_index = hp.operation_index();
-    if !db::record_processed_tx(&state.pool, &payment.id, hp_hash, op_index, new_stroops).await? {
+    let newly_recorded =
+        db::record_processed_tx(&state.pool, &payment.id, hp_hash, op_index, new_stroops).await?;
+    /* Already recorded and the intent has moved on: a duplicate, nothing to do.
+    Already recorded but still `pending`: an earlier attempt recorded this
+    transaction and then failed to write the status (issue #978). Re-run the
+    settlement below so the retry can finish it. */
+    if !newly_recorded && payment.status != "pending" {
         return Ok(false);
     }
 
@@ -1250,7 +1276,18 @@ async fn reconcile_active_payment(
         }
     };
 
-    let did_settle = settle(
+    /* On a re-run the transaction is already counted, so only the completing
+    transition is safe to repeat: the status guard in `update_payment_status`
+    admits a single `pending` -> `completed` write. An `underpaid` write would
+    be admitted again for a racing reconciler and fire `payment.underpaid`
+    twice, so that case is left alone. Known gap: if the interrupted attempt
+    was itself an underpayment, the intent stays `pending` until the sweeper
+    expires it. */
+    if !newly_recorded && status != "completed" {
+        return Ok(false);
+    }
+
+    settle(
         state,
         &payment,
         status,
@@ -1259,8 +1296,7 @@ async fn reconcile_active_payment(
         event,
         delta.as_deref(),
     )
-    .await;
-    Ok(did_settle)
+    .await
 }
 
 /// Handle a Horizon payment that matches a **terminal** (completed/expired)
@@ -1336,21 +1372,16 @@ async fn settle(
     paid_amount: &str,
     event: &str,
     delta: Option<&str>,
-) -> bool {
-    match db::update_payment_status(&state.pool, &payment.id, status, tx_hash, paid_amount).await {
-        Err(e) => {
-            warn!(payment_id = %payment.id, error = %e, "failed to update payment status");
-            return false;
-        }
-        Ok(false) => {
-            // A concurrent reconciler already settled this intent — skip the webhook.
-            debug!(
-                payment_id = %payment.id,
-                "skipping duplicate settlement (status guard rejected update)"
-            );
-            return false;
-        }
-        Ok(true) => {}
+) -> anyhow::Result<bool> {
+    /* A DB error is returned, not logged-and-dropped: the caller must hold the
+    poll cursor so this payment is retried (issue #978). */
+    if !db::update_payment_status(&state.pool, &payment.id, status, tx_hash, paid_amount).await? {
+        // A concurrent reconciler already settled this intent — skip the webhook.
+        debug!(
+            payment_id = %payment.id,
+            "skipping duplicate settlement (status guard rejected update)"
+        );
+        return Ok(false);
     }
     let settlement_latency_secs = elapsed_secs(&payment.created_at);
     info!(
@@ -1372,7 +1403,7 @@ async fn settle(
     worker is the safety net for the crash case, not a replacement for inline
     delivery. See issue #76 for the separate task of decoupling dispatch. */
     webhook::dispatch(state, &settled, event, delta).await;
-    true
+    Ok(true)
 }
 
 /// Floor and cap for the poller's failure backoff. Reuses the same
@@ -1715,8 +1746,15 @@ async fn handle_stream_event(state: &Arc<AppState>, block: &str, cursor: &mut St
             if let Some(cursor_age_secs) = hp.created_at.as_deref().and_then(elapsed_secs) {
                 info!(cursor_age_secs, "stream cursor advanced");
             }
+            /* No stream-side retry. A failure here leaves the poller's cursor
+            before this record, so the poller re-reads and retries it on its
+            next cycle. The stream cursor above may already be past it, which is
+            fine because the poller is the backstop (issue #978). */
             if let Err(e) = reconcile_payment(state, &hp).await {
-                warn!(error = %e, "failed to reconcile streamed payment");
+                warn!(
+                    error = %e,
+                    "failed to reconcile streamed payment; the poller will retry it"
+                );
             }
         }
         // The greeting payload (`"hello"`) and any non-record frames land here.
