@@ -1363,7 +1363,10 @@ mod tests {
 
     #[test]
     fn listener_mode_empty_defaults_to_stream() {
-        assert_eq!(ListenerMode::parse("").unwrap(), ListenerMode::Stream);
+        assert_eq!(
+            ListenerMode::parse("").expect("empty listener mode should parse"),
+            ListenerMode::Stream
+        );
     }
 
     #[test]
