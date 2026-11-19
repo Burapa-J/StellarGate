@@ -675,6 +675,7 @@ import { sortPayments } from "./sort.js";
 
   function renderRows() {
     var tbody = $("rows");
+    updatePaymentsCaption();
     var visible = sortedVisiblePayments();
     var active = store.get().activeRow;
     clear(tbody);
@@ -874,7 +875,8 @@ import { sortPayments } from "./sort.js";
 
   function rowFor(p, isActive) {
     var tr = document.createElement("tr");
-    tr.tabIndex = 0;
+    // Rows are not tab stops (#964): keyboard users reach a payment through
+    // the button in the Payment ID cell, which is the primary control.
     tr.dataset.paymentId = p.id;
     if (isActive) {
       tr.className = "row-active";
@@ -934,14 +936,18 @@ import { sortPayments } from "./sort.js";
     if (!isColumnVisible("created")) createdCell.hidden = true;
     tr.appendChild(createdCell);
 
-    var idCell = labelledCell("Payment ID", "mono", shortId(p.id));
+    /* The button is the accessible control (#964). Its click bubbles to the
+       row listener below, which is the mouse convenience on top of it. */
+    var idCell = document.createElement("td");
+    idCell.setAttribute("data-label", "Payment ID");
     idCell.setAttribute("data-column", "id");
+    var openButton = el("button", "row-link mono", shortId(p.id));
+    openButton.type = "button";
+    openButton.setAttribute("aria-label", "View payment " + p.id);
+    idCell.appendChild(openButton);
     tr.appendChild(idCell);
 
-    tr.addEventListener("click", function () { openDetail(p.id, tr); });
-    tr.addEventListener("keydown", function (ev) {
-      if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); openDetail(p.id, tr); }
-    });
+    tr.addEventListener("click", function () { openDetail(p.id, openButton); });
     return tr;
   }
 
@@ -1581,6 +1587,20 @@ import { sortPayments } from "./sort.js";
 
   // ── Filter / search UI ────────────────────────────────────────────────────
 
+  /**
+   * Keep the payments table caption in step with the active filters (#964).
+   * Screen-reader users hear the caption when they enter the table, so it
+   * must say what the rows currently represent.
+   */
+  function updatePaymentsCaption() {
+    var node = $("payments-caption");
+    if (!node) return;
+    var state = store.get();
+    var text = "Payments: " + (state.status || "all") + " statuses";
+    if (state.search) text += ', matching "' + state.search + '"';
+    node.textContent = text;
+  }
+
   function syncFilterUi() {
     var state = store.get();
     Array.prototype.forEach.call(document.querySelectorAll(".chip"), function (chip) {
@@ -1598,6 +1618,8 @@ import { sortPayments } from "./sort.js";
 
     var size = $("page-size");
     if (size) size.value = String(state.pageSize);
+
+    updatePaymentsCaption();
 
     var after = $("created-after");
     if (after && after.value !== state.createdAfter) after.value = state.createdAfter;

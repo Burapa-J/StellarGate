@@ -491,7 +491,10 @@ fn every_dashboard_helper_the_script_calls_is_defined() {
 
 #[test]
 fn dashboard_print_styles_hide_chrome_and_keep_table_readable() {
-    assert!(DASHBOARD_CSS.contains("@media print"), "print styles must be defined");
+    assert!(
+        DASHBOARD_CSS.contains("@media print"),
+        "print styles must be defined"
+    );
     for needle in [
         ".topbar,",
         ".toolbar,",
@@ -1295,5 +1298,72 @@ fn table_rows_use_content_visibility_for_responsiveness() {
         "the mobile card layout needs a larger contain-intrinsic-size because \
          each row is a stack of labelled cells rather than a single-line table \
          row (#805)"
+    );
+}
+
+/// Regression: #964. Re-applies the table semantics that #928 (#818, #820)
+/// shipped and a later merge reverted. Every header of the payments table
+/// must be a column header, and the table needs a caption.
+#[test]
+fn issue_964_payments_table_has_caption_and_column_scopes() {
+    let start = HTML
+        .find("id=\"payments\"")
+        .expect("payments table must exist in dashboard.html");
+    let table = &HTML[start..];
+    let table = &table[..table.find("</table>").expect("payments table must close")];
+
+    assert!(
+        table.contains("<caption id=\"payments-caption\""),
+        "the payments table needs a caption so screen-reader users hear the \
+         active filters (#964)"
+    );
+    // Count header cells exactly: `<th ` or `<th>`, so `<thead>` is not counted.
+    let headers = table.matches("<th ").count() + table.matches("<th>").count();
+    let scoped = table.matches("<th scope=\"col\"").count();
+    assert!(headers > 0, "payments table must have headers");
+    assert_eq!(
+        headers, scoped,
+        "every payments header must carry scope=\"col\" (#964)"
+    );
+}
+
+/// Regression: #964. Payment rows must not be tab stops. Keyboard users open a
+/// payment through the button in the Payment ID cell instead.
+#[test]
+fn issue_964_payment_rows_are_not_focusable() {
+    let start = JS
+        .find("function rowFor(")
+        .expect("rowFor must exist in dashboard.js");
+    let body = &JS[start..];
+    let body = &body[..body
+        .find("function webhookBadge(")
+        .expect("rowFor must end")];
+
+    assert!(
+        !body.contains("tr.tabIndex") && !body.contains("tabindex"),
+        "payment rows must not carry tabindex; the Payment ID button is the \
+         keyboard control (#964)"
+    );
+    assert!(
+        body.contains("el(\"button\", \"row-link mono\""),
+        "the Payment ID cell must contain a real <button> (#964)"
+    );
+    assert!(
+        !body.contains("tr.addEventListener(\"keydown\""),
+        "the row keydown handler must go; the button's native activation \
+         replaces it (#964)"
+    );
+}
+
+/// Regression: #964. The caption must follow the active filters.
+#[test]
+fn issue_964_payments_caption_tracks_filters() {
+    assert!(
+        JS.contains("function updatePaymentsCaption()"),
+        "dashboard.js must define updatePaymentsCaption (#964)"
+    );
+    assert!(
+        JS.matches("updatePaymentsCaption();").count() >= 2,
+        "the caption must refresh on filter changes and on row render (#964)"
     );
 }
