@@ -297,6 +297,7 @@ export function buildListQuery(filters) {
   var f = filters || {};
   var parts = ["limit=" + encodeURIComponent(f.pageSize || 25)];
   if (f.status) parts.push("status=" + encodeURIComponent(f.status));
+  if (f.asset) parts.push("asset=" + encodeURIComponent(f.asset));
   if (f.createdAfter) {
     parts.push(
       "created_after=" + encodeURIComponent(f.createdAfter + "T00:00:00Z")

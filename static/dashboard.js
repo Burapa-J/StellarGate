@@ -146,6 +146,15 @@ import { sortPayments } from "./sort.js";
     });
   }
 
+  /** Read the payment id from a "#payment=<id>" deep link (#780). */
+  function hashPaymentId() {
+    try {
+      return new URLSearchParams(window.location.hash.slice(1)).get("payment") || "";
+    } catch (e) {
+      return "";
+    }
+  }
+
   function writeHashState() {
     try {
       var hash = serializeHash(store.get());
@@ -624,7 +633,10 @@ import { sortPayments } from "./sort.js";
       loadNetworkBadge();
       pollHealth();
       loadSummary();
+      syncFilterUi();
       reload();
+      var linked = hashPaymentId();
+      if (linked) openDetail(linked);
     });
   }
 
@@ -732,6 +744,7 @@ import { sortPayments } from "./sort.js";
         markNewRows(payments, isFirstPage);
         var rows = store.get().loadedPayments.concat(payments);
         store.update({ loadedPayments: rows });
+        collectAssets(payments);
         renderRows();
         renderAssetTotals();
 
@@ -1135,6 +1148,7 @@ import { sortPayments } from "./sort.js";
    */
   function openDetail(id, trigger) {
     store.update({ selectedPaymentId: id });
+    writeHashState();
     state.detailTrigger = trigger || null;
 
     var detail = $("detail");
@@ -1828,6 +1842,51 @@ import { sortPayments } from "./sort.js";
 
   // ── Filter / search UI ────────────────────────────────────────────────────
 
+  /** Add asset codes from `payments` to the dropdown's known set (#689). */
+  function collectAssets(payments) {
+    var known = store.get().knownAssets.slice();
+    var changed = false;
+    payments.forEach(function (p) {
+      var a = p.asset || "XLM";
+      if (known.indexOf(a) < 0) { known.push(a); changed = true; }
+    });
+    if (!changed) return;
+    known.sort();
+    store.update({ knownAssets: known });
+    syncAssetOptions();
+  }
+
+  function syncAssetOptions() {
+    var sel = $("asset-filter");
+    if (!sel) return;
+    var st = store.get();
+    var codes = st.knownAssets.slice();
+    if (st.asset && codes.indexOf(st.asset) < 0) codes.push(st.asset);
+    clear(sel);
+    var all = document.createElement("option");
+    all.value = "";
+    all.textContent = "All assets";
+    sel.appendChild(all);
+    codes.forEach(function (c) {
+      var o = document.createElement("option");
+      o.value = c;
+      o.textContent = c;
+      sel.appendChild(o);
+    });
+    sel.value = st.asset;
+  }
+
+  function hasActiveFilters() {
+    var s = store.get();
+    return !!(s.status || s.asset || s.search || s.createdAfter || s.createdBefore);
+  }
+
+  /** Reset every filter, the hash and the inputs, then reload (#779). */
+  function clearFilters() {
+    store.update({ status: "", asset: "", search: "", createdAfter: "", createdBefore: "" });
+    onFilterChange();
+  }
+
   function syncFilterUi() {
     var state = store.get();
     Array.prototype.forEach.call(document.querySelectorAll(".chip"), function (chip) {
@@ -1855,11 +1914,14 @@ import { sortPayments } from "./sort.js";
     var auto = $("auto-refresh");
     if (auto) auto.checked = state.autoRefresh;
 
+    syncAssetOptions();
+    var clr = $("clear-filters");
+    if (clr) clr.hidden = !hasActiveFilters();
+    syncSearchClear();
     var minA = $("min-amount");
     if (minA && minA.value !== state.minAmount) minA.value = state.minAmount;
     var maxA = $("max-amount");
     if (maxA && maxA.value !== state.maxAmount) maxA.value = state.maxAmount;
-
     syncPresetUi();
   }
 
@@ -2139,6 +2201,13 @@ import { sortPayments } from "./sort.js";
         onFilterChange();
       });
     });
+
+    $("asset-filter").addEventListener("change", function () {
+      store.update({ asset: $("asset-filter").value });
+      onFilterChange();
+    });
+
+    $("clear-filters").addEventListener("click", clearFilters);
 
     window.addEventListener("hashchange", function () {
       if (store.get().key) { applyHash(); reload(); }

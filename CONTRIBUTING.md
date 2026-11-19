@@ -83,6 +83,21 @@ docker compose up --build
    shapes, or webhook payloads, update the README and (for `.env.example`-
    affecting changes) `.env.example` in the same PR.
 
+## Working on the dashboard
+
+The dashboard is plain HTML, CSS and ES modules in `static/`, compiled into the
+binary with `include_str!`, so there is no build step.
+
+- Edit `static/dashboard.js` (controller), `static/state.js` (view state, URL
+  hash), `static/format.js` (pure helpers) and `static/dashboard.html`/`.css`.
+- Run `cargo run`, open `http://localhost:3000/dashboard` and reload after each
+  edit (rebuild with `cargo run` since assets are embedded).
+- Quick checks: `node --check static/dashboard.js`,
+  `node --test static/tests/*.test.js` and
+  `cargo test --test dashboard_asset_tests`.
+- Keep the API key out of URLs, logs and the console; only filters and
+  `payment=<id>` may go in the hash.
+
 ## Before Opening a Pull Request
 
 Run the same checks CI runs, so review isn't spent on formatting/lint churn:

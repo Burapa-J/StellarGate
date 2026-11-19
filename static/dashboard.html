@@ -297,6 +297,11 @@
               <span class="pill-text">Expired</span>
             </button>
           </div>
+          <div class="filters" role="group" aria-label="Filter by asset">
+            <label class="small" for="asset-filter">Asset</label>
+            <select id="asset-filter"><option value="">All assets</option></select>
+          </div>
+          <button id="clear-filters" class="ghost" type="button" hidden>Clear filters</button>
           <div class="filters" role="group" aria-label="Filter by creation date">
             <label class="small" for="created-after">From</label>
             <input id="created-after" type="date" />
