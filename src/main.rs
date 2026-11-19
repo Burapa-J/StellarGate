@@ -14,7 +14,9 @@ use stellargate::{
     metrics::{
         AuthMetrics, HorizonMetrics, HttpMetrics, PaymentMetrics, TrustlineMetrics, WebhookMetrics,
     },
-    retention, supervise, webhook,
+    retention,
+    supervise,
+    webhook,
 };
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -142,9 +144,15 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!("StellarGate API listening on {addr}");
 
+    let shutdown_grace = Duration::from_secs(
+        std::env::var("SHUTDOWN_GRACE_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_SHUTDOWN_GRACE_SECS),
+    );
+
     // One overall deadline covers both the HTTP drain and the worker drain, so
     // the process can never overrun the orchestrator's stop grace period.
-    let shutdown_grace = Duration::from_secs(DEFAULT_SHUTDOWN_GRACE_SECS);
     let deadline = tokio::time::Instant::now() + shutdown_grace;
 
     // Signal the workers at the same time as the HTTP graceful shutdown starts

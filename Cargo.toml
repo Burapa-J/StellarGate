@@ -56,5 +56,6 @@ axum-test = "21"
 tokio = { version = "1", features = ["full"] }
 time = { version = "0.3", features = ["parsing"] }
 wiremock = "0.6.5"
+tower = { version = "0.5", features = ["util"] }
 proptest = "1.11"
 tracing-test = { version = "0.2", features = ["no-env-filter"] }
