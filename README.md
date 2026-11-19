@@ -1353,6 +1353,10 @@ The operator dashboard. Also serves `/dashboard/app.css` and
 
 Every on-chain payment matched by memo, destination, and asset resolves as follows:
 
+**Memo matching is case-insensitive and ignores surrounding whitespace.** A payer who types `ab12cd34` or ` AB12CD34 ` by hand settles intent `AB12CD34`. Intent memos are upper-case hex, so this normalisation cannot match two different intents.
+
+**Path payments are supported.** `path_payment_strict_send` and `path_payment_strict_receive` operations settle an intent when they deliver the intent's asset and amount to its destination with the right memo. The amount compared is what the destination received, so a payer who converts on the way is credited in the asset the merchant asked for. A path payment that delivers a different asset is rejected.
+
 | Scenario | `status` | Event | `delta` |
 |---|---|---|---|
 | Paid exactly | `completed` | `payment.completed` | — |
