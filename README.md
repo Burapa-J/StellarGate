@@ -110,7 +110,6 @@ src/
     └── payments.rs  Payment and webhook-delivery handlers
 
 static/            Dashboard assets, compiled into the binary via include_str!
-migrations/        Versioned SQL, applied automatically on startup
 tests/             Integration tests (API, concurrency, rate limits, webhooks, trustlines)
 ```
 
