@@ -232,17 +232,18 @@ test.describe("keyboard shortcuts", () => {
   }) => {
     await signIn(page, seedData);
 
-    // A row must be focused for the row's own Space handler to be in play.
-    // Focus first, then measure: `focus()` scrolls the element into view, and
-    // on a mobile card layout the first row is far above the fold — so
-    // measuring before focusing would attribute that scroll to the Space key.
-    await page.locator("#rows tr").first().focus();
+    // The payment's button in the row is the focusable control (#964); rows are
+    // not tab stops. Focus first, then measure: `focus()` scrolls the element
+    // into view, and on a mobile card layout the first row is far above the
+    // fold — so measuring before focusing would attribute that scroll to the
+    // Space key.
+    await page.locator("#rows tr").first().locator("button.row-link").focus();
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
     const before = await page.evaluate(() => window.scrollY);
 
     await page.keyboard.press(" ");
 
-    // Space on a focused row opens the payment rather than scrolling the page.
+    // Space on the focused button opens the payment rather than scrolling the page.
     await expect(page.locator("#detail")).toBeVisible();
     const after = await page.evaluate(() => window.scrollY);
     expect(after, "Space must not scroll the page").toBe(before);

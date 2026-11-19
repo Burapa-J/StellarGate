@@ -207,137 +207,47 @@ impl TaskHealth {
         state.restarts = state.restarts.saturating_add(1);
     }
 
-    // ── Success / gateway markers ─────────────────────────────────────────────
-
-    /// Record a successful Horizon poll cycle or stream event. Updates the
-    /// last-success timestamp used by `/ready` to detect a stalled poller.
-    pub fn note_success(&self) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        self.inner.last_success_unix.store(now, Ordering::Relaxed);
-    }
-
-    /// Unix timestamp (seconds) of the last successful poll/stream event, or
-    /// `0` if none has been recorded yet.
-    pub fn last_success_unix(&self) -> i64 {
-        self.inner.last_success_unix.load(Ordering::Relaxed)
-    }
-
-    /// Record that the boot-time gateway account check succeeded.
-    pub fn set_gateway_account_exists(&self, exists: bool) {
-        self.inner
-            .gateway_account_exists
-            .store(exists, Ordering::Relaxed);
-    }
-
-    /// Whether the gateway account was confirmed to exist at boot.
-    pub fn gateway_account_exists(&self) -> bool {
-        self.inner.gateway_account_exists.load(Ordering::Relaxed)
-    }
-
     // ── Queries ───────────────────────────────────────────────────────────────
 
-    /// Names of required tasks that are not currently running.
-    pub fn dead_required_tasks(&self) -> Vec<&'static str> {
-        let required = self.inner.required.lock().unwrap_or_else(|e| e.into_inner());
-        let tasks = self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner());
-        required
-            .iter()
-            .filter(|name| !tasks.get(*name).map(|s| s.running).unwrap_or(false))
-            .copied()
-            .collect()
+    /// The reason `name` was disabled by configuration, if any.
+    pub fn disabled_reason(&self, name: &'static str) -> Option<&'static str> {
+        self.inner
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .and_then(|s| s.disabled_reason)
     }
 
-    /// Names of required tasks that are crash-looping (consecutive failures
-    /// at or above [`CRASH_LOOP_THRESHOLD`]).
-    pub fn crash_looping_required_tasks(&self) -> Vec<&'static str> {
-        let required = self.inner.required.lock().unwrap_or_else(|e| e.into_inner());
+    /// Names of required tasks that are not currently running (and not
+    /// disabled). Used by `GET /health` to surface dead workers.
+    pub fn dead_required_tasks(&self) -> Vec<&'static str> {
+        let required = self
+            .inner
+            .required
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tasks = self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner());
         required
             .iter()
+            .copied()
             .filter(|name| {
                 tasks
-                    .get(*name)
-                    .map(|s| s.consecutive_failures >= CRASH_LOOP_THRESHOLD)
-                    .unwrap_or(false)
+                    .get(name)
+                    .map(|s| !s.running && s.disabled_reason.is_none())
+                    .unwrap_or(true)
             })
-            .copied()
             .collect()
     }
 
-    /// Total panics recorded across all tasks.
-    pub fn failed(&self) -> u64 {
-        self.inner.failed.load(Ordering::Relaxed)
-    }
-
-    /// Total `task_started` calls across all tasks.
-    pub fn started(&self) -> u64 {
-        self.inner.started.load(Ordering::Relaxed)
-    }
-
-    /// Total clean `task_stopped` calls across all tasks.
-    pub fn stopped(&self) -> u64 {
-        self.inner.stopped.load(Ordering::Relaxed)
-    }
-
-    /// Names of the tasks currently running, for the shutdown-deadline log.
-    pub fn running_tasks(&self) -> Vec<&'static str> {
-        let tasks = self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner());
-        let mut running: Vec<&'static str> = tasks
-            .iter()
-            .filter(|(_, s)| s.running)
-            .map(|(name, _)| *name)
-            .collect();
-        running.sort_unstable();
-        running
-    }
-
-    /// Supervisor-triggered restarts recorded for `name`; `0` if unknown.
-    pub fn restarts(&self, name: &str) -> u64 {
-        let tasks = self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner());
-        tasks.get(name).map_or(0, |s| s.restarts)
-    }
-
-    /// Why `name` is disabled by configuration, if it is.
-    pub fn disabled_reason(&self, name: &str) -> Option<&'static str> {
-        let tasks = self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner());
-        tasks.get(name).and_then(|s| s.disabled_reason)
-    }
-
-    /// Snapshot of every known task, for `/metrics`.
-    pub fn snapshots(&self) -> Vec<TaskSnapshot> {
-        let required = self.inner.required.lock().unwrap_or_else(|e| e.into_inner());
-        let tasks = self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner());
-        tasks
-            .iter()
-            .map(|(name, state)| TaskSnapshot {
-                name: (*name).to_string(),
-                restarts: state.restarts,
-                running: state.running,
-                consecutive_failures: state.consecutive_failures,
-                disabled_reason: state.disabled_reason.map(|r| r.to_string()),
-            })
-            .chain(
-                required
-                    .iter()
-                    .filter(|name| !tasks.contains_key(*name))
-                    .map(|name| TaskSnapshot {
-                        name: (*name).to_string(),
-                        restarts: 0,
-                        running: false,
-                        consecutive_failures: 0,
-                        disabled_reason: None,
-                    }),
-            )
-            .collect()
-    }
-
-    /// How many required tasks are not disabled by configuration. Used by
-    /// Prometheus: `stellargate_tasks_expected`.
+    /// How many required tasks are not disabled. Used by Prometheus:
+    /// `stellargate_tasks_expected`.
     pub fn expected_tasks(&self) -> u64 {
-        let required = self.inner.required.lock().unwrap_or_else(|e| e.into_inner());
+        let required = self
+            .inner
+            .required
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tasks = self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner());
         required
             .iter()
@@ -350,10 +260,14 @@ impl TaskHealth {
             .count() as u64
     }
 
-    /// How many required, non-disabled tasks are currently running. Used by
-    /// Prometheus: `stellargate_tasks_live`.
+    /// How many required, non-disabled tasks are currently running.
+    /// Used by Prometheus: `stellargate_tasks_live`.
     pub fn live_tasks(&self) -> u64 {
-        let required = self.inner.required.lock().unwrap_or_else(|e| e.into_inner());
+        let required = self
+            .inner
+            .required
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tasks = self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner());
         required
             .iter()
@@ -364,6 +278,102 @@ impl TaskHealth {
                     .unwrap_or(false)
             })
             .count() as u64
+    }
+
+    /// Total task panics across all tasks (not Fatal exits — those are not
+    /// panics).
+    pub fn failed(&self) -> u64 {
+        self.inner.failed.load(Ordering::Relaxed)
+    }
+
+    /// Total `task_started` calls across all tasks, including restarts.
+    pub fn started(&self) -> u64 {
+        self.inner.started.load(Ordering::Relaxed)
+    }
+
+    /// Total clean `task_stopped` calls across all tasks.
+    pub fn stopped(&self) -> u64 {
+        self.inner.stopped.load(Ordering::Relaxed)
+    }
+
+    /// Restart count for `name`, or 0 if `name` is unknown.
+    pub fn restarts(&self, name: &'static str) -> u64 {
+        self.inner
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .map(|s| s.restarts)
+            .unwrap_or(0)
+    }
+
+    /// Required tasks that have exceeded [`CRASH_LOOP_THRESHOLD`] consecutive
+    /// panics. Used by `GET /health` and tests.
+    pub fn crash_looping_required_tasks(&self) -> Vec<&'static str> {
+        let required = self
+            .inner
+            .required
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tasks = self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        required
+            .iter()
+            .copied()
+            .filter(|name| {
+                tasks
+                    .get(name)
+                    .map(|s| s.consecutive_failures >= CRASH_LOOP_THRESHOLD)
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    /// Snapshot of all known tasks for Prometheus rendering.
+    pub fn snapshot(&self) -> Vec<TaskSnapshot> {
+        self.inner
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(name, state)| TaskSnapshot {
+                name: name.to_string(),
+                restarts: state.restarts,
+                running: state.running,
+                consecutive_failures: state.consecutive_failures,
+                disabled_reason: state.disabled_reason.map(|s| s.to_string()),
+            })
+            .collect()
+    }
+
+    // ── Horizon cursor freshness ──────────────────────────────────────────────
+
+    /// Record a successful Horizon poll or stream event. Updates
+    /// `last_success_unix` so `/ready` and Prometheus can track detection lag.
+    pub fn note_success(&self) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.inner.last_success_unix.store(now, Ordering::Relaxed);
+    }
+
+    /// Unix timestamp of the last successful Horizon poll or stream event.
+    /// Returns `0` until the first call to [`note_success`].
+    pub fn last_success_unix(&self) -> i64 {
+        self.inner.last_success_unix.load(Ordering::Relaxed)
+    }
+
+    // ── Gateway account existence ─────────────────────────────────────────────
+
+    pub fn set_gateway_account_exists(&self, exists: bool) {
+        self.inner
+            .gateway_account_exists
+            .store(exists, Ordering::Relaxed);
+    }
+
+    pub fn gateway_account_exists(&self) -> bool {
+        self.inner.gateway_account_exists.load(Ordering::Relaxed)
     }
 }
 

@@ -20,6 +20,7 @@
 //! small tolerance window. See the README "Verifying webhooks" section for the
 //! verification recipe and recommended window.
 
+use crate::supervise::TaskExit;
 use crate::{AppState, db};
 // `KeyInit` provides `new_from_slice`; it moved off `Mac` in hmac 0.13.
 use hmac::{Hmac, KeyInit, Mac};
@@ -78,22 +79,18 @@ pub fn sign(secret: &str, timestamp: i64, body: &[u8]) -> String {
     hex::encode(mac.finalize().into_bytes())
 }
 
-/// Receiver-side check: is `signature` (hex) the HMAC-SHA256 of
-/// `"{timestamp}.{body}"` under `secret`?
-///
-/// The comparison is constant-time (`verify_slice`), so a mismatch leaks no
-/// prefix of the expected MAC. Freshness of `timestamp` is the caller's job.
+/// Check a webhook signature produced by [`sign`] for the given timestamp and
+/// body, in constant time over the hex digests. Receivers do the same check.
 pub fn verify_signature(secret: &str, timestamp: i64, body: &[u8], signature: &str) -> bool {
-    let Ok(expected) = hex::decode(signature) else {
+    let expected = sign(secret, timestamp, body);
+    if expected.is_empty() || expected.len() != signature.len() {
         return false;
-    };
-    let Ok(mut mac) = HmacSha256::new_from_slice(secret.as_bytes()) else {
-        return false;
-    };
-    mac.update(timestamp.to_string().as_bytes());
-    mac.update(b".");
-    mac.update(body);
-    mac.verify_slice(&expected).is_ok()
+    }
+    expected
+        .bytes()
+        .zip(signature.bytes())
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
 }
 
 /// Current Unix time in seconds, used as the webhook signing timestamp.
@@ -476,7 +473,10 @@ async fn redrive_one(state: &Arc<AppState>, delivery: db::WebhookDelivery) {
 /// the process shuts down. Runs one pass immediately on startup — before the
 /// first sleep — so a restart repairs any deliveries left `pending`/`failed`
 /// by the previous process without waiting a full interval.
-pub async fn run_redrive_worker(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
+pub async fn run_redrive_worker(
+    state: Arc<AppState>,
+    mut shutdown: watch::Receiver<bool>,
+) -> TaskExit {
     let interval = Duration::from_secs(state.config.webhook_redrive_interval_secs.max(1));
     info!(
         interval_secs = state.config.webhook_redrive_interval_secs,
@@ -493,7 +493,7 @@ pub async fn run_redrive_worker(state: Arc<AppState>, mut shutdown: watch::Recei
             _ = tokio::time::sleep(interval) => {}
             _ = shutdown.changed() => {
                 info!("webhook redrive worker shutting down");
-                return;
+                return TaskExit::ShutdownRequested;
             }
         }
     }
@@ -737,8 +737,7 @@ mod tests {
             // Confirm the serialised bytes contain the event string, i.e. that
             // it survives the round-trip through serde_json::to_vec used in dispatch().
             let body = serde_json::to_vec(&payload).unwrap();
-            let body_str =
-                String::from_utf8(body).expect("webhook body should be valid UTF-8");
+            let body_str = String::from_utf8(body).expect("webhook body should be valid UTF-8");
             assert!(
                 body_str.contains(event),
                 "serialised body must contain the event string (event={event})"

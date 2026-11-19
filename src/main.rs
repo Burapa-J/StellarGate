@@ -14,7 +14,9 @@ use stellargate::{
     metrics::{
         AuthMetrics, HorizonMetrics, HttpMetrics, PaymentMetrics, TrustlineMetrics, WebhookMetrics,
     },
-    retention, supervise, webhook,
+    retention,
+    supervise,
+    webhook,
 };
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -27,7 +29,9 @@ const USER_AGENT: &str = concat!("StellarGate/", env!("CARGO_PKG_VERSION"));
 /// configurable per-attempt timeout instead.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Fallback overall shutdown deadline when `SHUTDOWN_GRACE_SECS` is unset.
+/// Overall shutdown deadline: the process exits after this even if HTTP or
+/// background tasks are still draining, so it stays within the orchestrator's
+/// stop grace period.
 const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 30;
 
 /// Timeout for the `healthcheck` subcommand's probe request. Kept short so a
@@ -39,6 +43,11 @@ const HEALTHCHECK_DEFAULT_PATH: &str = "health";
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Load `.env` first so every setting in it is visible to the code below:
+    // `RUST_LOG` to the tracing filter (#965), and `PORT` to the `healthcheck`
+    // probe (#966). Variables already set in the process environment win.
+    dotenvy::dotenv().ok();
+
     // Handle the `healthcheck` subcommand before anything else: no config
     // loading, tracing init, DB open, migrations, Horizon calls, or port
     // binding. Container probes must not start a second server.
@@ -55,10 +64,8 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
-    dotenvy::dotenv().ok();
 
     let cfg = Config::from_env()?;
-    let shutdown_grace = shutdown_grace();
     // `open_pool` builds every connection through `db::connect_options`, which
     // enables `PRAGMA foreign_keys = ON`, so referential integrity is enforced
     // on each pooled connection without any extra setup here.
@@ -105,48 +112,44 @@ async fn main() -> Result<()> {
         health.require("stream");
     }
 
-    // Each worker is supervised from a factory, so a panic or unexpected return
-    // restarts it with fresh clones of its arguments.
     let stream = (state.config.listener_mode == ListenerMode::Stream).then(|| {
-        let (st, rx) = (state.clone(), shutdown_rx.clone());
-        supervise::supervise(health.clone(), "stream", shutdown_rx.clone(), move || {
-            worker_exit(horizon::run_stream_listener(st.clone(), rx.clone()), rx.clone())
+        supervise::supervise(health.clone(), "stream", shutdown_rx.clone(), {
+            let (state, rx) = (state.clone(), shutdown_rx.clone());
+            move || horizon::run_stream_listener(state.clone(), rx.clone())
         })
     });
-    let poller = {
-        let (st, rx) = (state.clone(), shutdown_rx.clone());
-        supervise::supervise(health.clone(), "poller", shutdown_rx.clone(), move || {
-            worker_exit(horizon::run_poller(st.clone(), rx.clone()), rx.clone())
-        })
-    };
-    let sweeper = {
-        let (st, rx) = (state.clone(), shutdown_rx.clone());
-        supervise::supervise(health.clone(), "sweeper", shutdown_rx.clone(), move || {
-            worker_exit(expiry::run_sweeper(st.clone(), rx.clone()), rx.clone())
-        })
-    };
-    let retention = {
-        let (st, rx) = (state.clone(), shutdown_rx.clone());
-        supervise::supervise(health.clone(), "retention", shutdown_rx.clone(), move || {
-            worker_exit(retention::run_retention_worker(st.clone(), rx.clone()), rx.clone())
-        })
-    };
-    let trustline_checker = {
-        let (st, rx) = (state.clone(), shutdown_rx.clone());
-        supervise::supervise(health.clone(), "trustline_checker", shutdown_rx.clone(), move || {
-            horizon::run_trustline_checker(st.clone(), rx.clone())
-        })
-    };
-    let redrive = {
-        let (st, rx) = (state.clone(), shutdown_rx.clone());
-        supervise::supervise(health.clone(), "redrive", shutdown_rx.clone(), move || {
-            worker_exit(webhook::run_redrive_worker(st.clone(), rx.clone()), rx.clone())
-        })
-    };
+    let poller = supervise::supervise(health.clone(), "poller", shutdown_rx.clone(), {
+        let (state, rx) = (state.clone(), shutdown_rx.clone());
+        move || horizon::run_poller(state.clone(), rx.clone())
+    });
+    let sweeper = supervise::supervise(health.clone(), "sweeper", shutdown_rx.clone(), {
+        let (state, rx) = (state.clone(), shutdown_rx.clone());
+        move || expiry::run_sweeper(state.clone(), rx.clone())
+    });
+    let retention = supervise::supervise(health.clone(), "retention", shutdown_rx.clone(), {
+        let (state, rx) = (state.clone(), shutdown_rx.clone());
+        move || retention::run_retention_worker(state.clone(), rx.clone())
+    });
+    let trustline_checker =
+        supervise::supervise(health.clone(), "trustline_checker", shutdown_rx.clone(), {
+            let (state, rx) = (state.clone(), shutdown_rx.clone());
+            move || horizon::run_trustline_checker(state.clone(), rx.clone())
+        });
+    let redrive = supervise::supervise(health.clone(), "redrive", shutdown_rx.clone(), {
+        let (state, rx) = (state.clone(), shutdown_rx.clone());
+        move || webhook::run_redrive_worker(state.clone(), rx.clone())
+    });
 
-    let addr = format!("0.0.0.0:{}", state.config.port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let addr = SocketAddr::new(state.config.bind_addr, state.config.port);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
     info!("StellarGate API listening on {addr}");
+
+    let shutdown_grace = Duration::from_secs(
+        std::env::var("SHUTDOWN_GRACE_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_SHUTDOWN_GRACE_SECS),
+    );
 
     // One overall deadline covers both the HTTP drain and the worker drain, so
     // the process can never overrun the orchestrator's stop grace period.
@@ -185,7 +188,12 @@ async fn main() -> Result<()> {
     };
 
     if tokio::time::timeout_at(deadline, shutdown).await.is_err() {
-        let running = health.running_tasks();
+        let running: Vec<String> = health
+            .snapshots()
+            .into_iter()
+            .filter(|task| task.running)
+            .map(|task| task.name)
+            .collect();
         warn!(
             timeout_secs = shutdown_grace.as_secs(),
             ?running,
@@ -195,33 +203,6 @@ async fn main() -> Result<()> {
 
     info!("shutdown complete");
     Ok(())
-}
-
-/// Adapt a worker future (which resolves to `()`) to the supervisor's
-/// contract. A return after shutdown was requested is ordinary; any other
-/// return is unexpected, so it is reported as `Fatal` and restarted.
-async fn worker_exit(
-    worker: impl Future<Output = ()>,
-    shutdown: watch::Receiver<bool>,
-) -> stellargate::supervise::TaskExit {
-    worker.await;
-    if *shutdown.borrow() {
-        stellargate::supervise::TaskExit::ShutdownRequested
-    } else {
-        stellargate::supervise::TaskExit::Fatal("worker returned before shutdown".to_string())
-    }
-}
-
-/// Overall shutdown deadline, read from `SHUTDOWN_GRACE_SECS` (falling back to
-/// [`DEFAULT_SHUTDOWN_GRACE_SECS`]). The orchestrator's stop grace period must
-/// exceed this value.
-fn shutdown_grace() -> Duration {
-    let secs = std::env::var("SHUTDOWN_GRACE_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&s| s > 0)
-        .unwrap_or(DEFAULT_SHUTDOWN_GRACE_SECS);
-    Duration::from_secs(secs)
 }
 
 /// Build the probe URL for the `healthcheck` subcommand. Trims any leading
@@ -236,13 +217,17 @@ fn healthcheck_url(port: u16, path: &str) -> String {
     format!("http://127.0.0.1:{port}/{path}")
 }
 
+/// Resolve the port the `healthcheck` subcommand probes from the raw `PORT`
+/// value: the parsed port when it is a valid `u16`, otherwise the server's
+/// default of 3000.
+fn healthcheck_port(raw: Option<&str>) -> u16 {
+    raw.and_then(|p| p.parse::<u16>().ok()).unwrap_or(3000)
+}
+
 /// Probe the local server's health endpoint and return the process exit code:
 /// `0` when the endpoint answers with a success status, `1` otherwise.
 async fn run_healthcheck(path: &str) -> i32 {
-    let port = std::env::var("PORT")
-        .ok()
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(3000);
+    let port = healthcheck_port(std::env::var("PORT").ok().as_deref());
     let url = healthcheck_url(port, path);
 
     let client = match reqwest::Client::builder()
@@ -277,19 +262,15 @@ fn http_client(timeout: Duration) -> Result<reqwest::Client> {
         .build()?)
 }
 
-/// Report whether every accepted asset has a trustline on the gateway account.
+/// Check whether every accepted asset has a trustline on the gateway account.
 /// Advisory only: a missing trustline doesn't block boot, it just means
 /// payments in that asset will bounce until the trustline is added.
+///
+/// `check_trustlines` logs the outcome itself, so this logs only a failure to
+/// check; a successful boot check produces exactly one summary line.
 async fn report_trustlines(state: &Arc<AppState>) {
-    match horizon::check_trustlines(state).await {
-        Ok(missing) if missing.is_empty() => {
-            info!("gateway trustlines verified for all accepted assets")
-        }
-        Ok(missing) => info!(
-            ?missing,
-            "accepted assets with no trustline on the gateway account"
-        ),
-        Err(e) => warn!(error = %e, "could not verify gateway trustlines at startup"),
+    if let Err(e) = horizon::check_trustlines(state).await {
+        warn!(error = %e, "could not verify gateway trustlines at startup");
     }
 }
 
@@ -336,6 +317,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn healthcheck_port_uses_configured_value() {
+        assert_eq!(healthcheck_port(Some("8080")), 8080);
+    }
+
+    #[test]
+    fn healthcheck_port_defaults_to_3000_when_unset() {
+        assert_eq!(healthcheck_port(None), 3000);
+    }
+
+    #[test]
+    fn healthcheck_port_falls_back_on_unparseable_value() {
+        assert_eq!(healthcheck_port(Some("not-a-port")), 3000);
+        assert_eq!(healthcheck_port(Some("70000")), 3000);
+    }
+
+    #[test]
     fn healthcheck_url_uses_port_and_path() {
         assert_eq!(
             healthcheck_url(3000, "health"),
@@ -361,13 +358,7 @@ mod tests {
 
     #[test]
     fn healthcheck_url_falls_back_to_default_path() {
-        assert_eq!(
-            healthcheck_url(3000, ""),
-            "http://127.0.0.1:3000/health"
-        );
-        assert_eq!(
-            healthcheck_url(3000, "/"),
-            "http://127.0.0.1:3000/health"
-        );
+        assert_eq!(healthcheck_url(3000, ""), "http://127.0.0.1:3000/health");
+        assert_eq!(healthcheck_url(3000, "/"), "http://127.0.0.1:3000/health");
     }
 }

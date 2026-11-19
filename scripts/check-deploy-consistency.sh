@@ -18,9 +18,15 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 caddyfile="$repo_root/deploy/Caddyfile"
-api_mod="$repo_root/src/api/mod.rs"
 
 fail=0
+
+# Report a finding on stderr and mark the run as failed. The script exits
+# non-zero at the end if any finding was reported (issue #937).
+note() {
+  echo "$*" >&2
+  fail=1
+}
 
 if [[ ! -f "$caddyfile" ]]; then
   echo "missing $caddyfile" >&2
@@ -56,11 +62,20 @@ if [[ -f "$readme" ]]; then
         in_section && in_fence { print }
         in_section && !in_fence && /^## / { exit }
     ' "$readme")
+    # The tree nests files under their parent directory (e.g. `db.rs` lives
+    # under `src/`), so a bare token is resolved against the repo root, then
+    # against `src/`, and finally by name anywhere in the tree (issue #937).
     while IFS= read -r token; do
         [[ -z "$token" ]] && continue
-        if [[ ! -e "$token" ]]; then
-            note "$readme architecture tree names '$token' but it does not exist"
+        name="${token%/}"
+        if [[ -e "$token" || -e "src/$token" ]]; then
+            continue
         fi
+        if find "$repo_root" \( -path "$repo_root/.git" -o -path "$repo_root/target" \) -prune \
+            -o -name "$name" -print -quit 2>/dev/null | grep -q .; then
+            continue
+        fi
+        note "$readme architecture tree names '$token' but it does not exist"
     done < <(printf '%s\n' "$arch_block" \
         | grep -oE '[A-Za-z0-9_./-]+' \
         | grep -E '(/|\.(rs|js|sql|md|toml|yml|yaml|sh|html|css))$' \
@@ -68,15 +83,22 @@ if [[ -f "$readme" ]]; then
 fi
 
 # No document may claim a `migrations/` directory exists (issue #308, #868).
+# Lines that state the directory is gone (e.g. "there is no `migrations/`
+# directory") are allowed; only affirmative references are findings (#937).
 for doc in README.md MIGRATIONS.md CONTRIBUTING.md DEPLOYMENT.md; do
     [[ -f "$doc" ]] || continue
-    if grep -qE '(^|[^A-Za-z0-9_])migrations/' "$doc"; then
+    while IFS= read -r line; do
+        if grep -qiwE 'not|no|removed|used to|old' <<<"$line"; then
+            continue
+        fi
         note "$doc references a migrations/ directory, which was removed in #308"
-    fi
+        break
+    done < <(grep -E '(^|[^A-Za-z0-9_])migrations/' "$doc" || true)
 done
 
 if [[ $fail -eq 0 ]]; then
     echo "deploy assets are consistent with Dockerfile"
+    echo "deploy config consistent with app security headers"
 fi
 
-echo "deploy config consistent with app security headers"
+exit "$fail"

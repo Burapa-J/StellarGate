@@ -47,6 +47,7 @@ async fn make_state(horizon_url: String, stream_idle_timeout_secs: u64) -> Arc<A
         pool,
         config: Config {
             port: 0,
+            bind_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             database_url: "sqlite::memory:".into(),
             network: "testnet".into(),
             horizon_url,
@@ -71,6 +72,8 @@ async fn make_state(horizon_url: String, stream_idle_timeout_secs: u64) -> Arc<A
             webhook_delivery_retention_days: 30,
             idempotency_retention_days: 7,
             poll_interval_secs: 10,
+            expiry_sweep_interval_secs: 10,
+            trustline_check_interval_secs: 3600,
             poll_max_pages_per_cycle: 50,
             payment_ttl_secs: 3600,
             rate_limit_requests_per_sec: 10000,

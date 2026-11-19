@@ -914,7 +914,7 @@ pub fn render(
         "# HELP stellargate_task_restarts_total Supervisor restarts of a background task after panic or unexpected return.\n",
     );
     out.push_str("# TYPE stellargate_task_restarts_total counter\n");
-    let snaps = tasks.snapshots();
+    let snaps = tasks.snapshot();
     for snap in &snaps {
         out.push_str(&format!(
             "stellargate_task_restarts_total{{task=\"{}\"}} {}\n",

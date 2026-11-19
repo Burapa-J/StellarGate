@@ -9,15 +9,11 @@
 //! If a test here starts failing, the fix it guards has regressed — do not
 //! delete the test, restore the fix.
 
-use std::str::FromStr;
-use std::sync::Arc;
-
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use std::sync::Arc;
 use stellargate::{
-    AppState,
-    api::router,
+    AppState, TaskHealth, api,
     config::{AcceptedAsset, Config, ListenerMode},
     db,
     metrics::{
@@ -25,22 +21,25 @@ use stellargate::{
     },
 };
 use tower::ServiceExt;
-use uuid::Uuid;
 
-/// Build the application router under test, backed by a fresh in-memory
-/// database.
+/// Shared admin secret and metrics token, mirroring `tests/api_tests.rs`.
+const TEST_ADMIN_SECRET: &str = "test-admin-secret";
+const TEST_METRICS_TOKEN: &str = "test-metrics-token-32-chars-long";
+
+/// Build the application router under test, wired the same way the binary
+/// wires it, against a fresh shared-cache in-memory database.
 ///
 /// Kept in one place so the guard file stays black-box: tests only ever touch
-/// the public HTTP surface. The shared-cache DSN keeps every pooled connection
-/// on the same database.
+/// the public HTTP surface.
 async fn app() -> axum::Router {
-    let dsn = format!("sqlite:file:{}?mode=memory&cache=shared", Uuid::new_v4());
-    let pool = SqlitePoolOptions::new()
-        .min_connections(1)
-        .connect_with(SqliteConnectOptions::from_str(&dsn).unwrap())
+    let dsn = format!(
+        "sqlite:file:{}?mode=memory&cache=shared",
+        uuid::Uuid::new_v4()
+    );
+    let pool = db::open_pool(&dsn, 2, std::time::Duration::from_millis(5000))
         .await
-        .unwrap();
-    db::migrate(&pool).await.unwrap();
+        .expect("open test pool");
+    db::migrate(&pool).await.expect("migrate test pool");
 
     let config = Config {
         port: 0,
@@ -48,10 +47,7 @@ async fn app() -> axum::Router {
         network: "testnet".into(),
         horizon_url: String::new(),
         gateway_public: "UNCONFIGURED".into(),
-        accepted_assets: vec![AcceptedAsset {
-            code: "XLM".into(),
-            issuer: None,
-        }],
+        accepted_assets: AcceptedAsset::default_list(),
         webhook_secret: String::new(),
         webhook_retry_attempts: 1,
         webhook_retry_delay_ms: 0,
@@ -70,20 +66,20 @@ async fn app() -> axum::Router {
         poll_interval_secs: 10,
         poll_max_pages_per_cycle: 50,
         payment_ttl_secs: 3600,
-        rate_limit_requests_per_sec: 10_000,
-        db_pool_max_connections: 5,
+        rate_limit_requests_per_sec: 1000,
+        db_pool_max_connections: 2,
         db_busy_timeout_ms: 5000,
         cors_allowed_origins: vec![],
         listener_mode: ListenerMode::Poll,
         webhook_allow_private_targets: false,
-        admin_provisioning_secret: "test-admin-secret".into(),
-        metrics_token: String::new(),
+        admin_provisioning_secret: TEST_ADMIN_SECRET.into(),
+        metrics_token: TEST_METRICS_TOKEN.into(),
         request_timeout_secs: 30,
         stream_idle_timeout_secs: 30,
         trusted_proxy_cidrs: vec![],
     };
 
-    router(Arc::new(AppState {
+    api::router(Arc::new(AppState {
         pool,
         config,
         http: reqwest::Client::new(),
@@ -94,13 +90,16 @@ async fn app() -> axum::Router {
         trustline_metrics: TrustlineMetrics::new(),
         http_metrics: HttpMetrics::new(),
         payment_metrics: PaymentMetrics::new(),
-        task_health: stellargate::TaskHealth::new(),
+        task_health: TaskHealth::new(),
     }))
 }
 
 /// Send a request through the router and return the response status.
 async fn status_of(router: axum::Router, request: Request<Body>) -> StatusCode {
-    let response = router.oneshot(request).await.expect("router call failed");
+    let response = router
+        .oneshot(request)
+        .await
+        .expect("router call failed");
     response.status()
 }
 

@@ -126,7 +126,13 @@ fn is_blocked_ipv6(ip: Ipv6Addr) -> bool {
 fn embedded_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
     let seg = ip.segments();
     // NAT64 well-known prefix 64:ff9b::/96 (RFC 6052 / 8215).
-    if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 0 && seg[3] == 0 && seg[4] == 0 && seg[5] == 0 {
+    if seg[0] == 0x0064
+        && seg[1] == 0xff9b
+        && seg[2] == 0
+        && seg[3] == 0
+        && seg[4] == 0
+        && seg[5] == 0
+    {
         return Some(Ipv4Addr::new(
             (seg[6] >> 8) as u8,
             seg[6] as u8,
@@ -176,7 +182,6 @@ fn is_teredo(ip: Ipv6Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn blocks_loopback_link_local_and_private_v4() {
