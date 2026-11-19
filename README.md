@@ -201,6 +201,20 @@ deploy. Sign in with any merchant API key.
 | Webhook deliveries | Every attempt for a payment, with a one-click **Redeliver** |
 | Health | Live `/ready` indicator, polled every 30s |
 
+**Filters.** Status chips, an asset dropdown (filled from the assets your
+payments use), a date range and a search box combine freely. A **Clear
+filters** button appears only while a filter is active and resets the state,
+the URL hash and the inputs in one click. Changing a filter resets pagination.
+
+**Deep links.** `/dashboard#payment=<id>` opens that payment's detail drawer
+on load; the hash follows the drawer open/close, and an unknown id shows the
+drawer's error state. Only filters and payment ids go in the hash. The API key
+never appears in a URL.
+
+**Modules.** `dashboard.js` is the controller, `state.js` the view-state store
+and hash serialisation, `format.js` the pure formatting and query helpers,
+`dashboard-theme.js` the theme toggle. Screenshots: see the PR description.
+
 The detail panel is a modal `<dialog>`: opened with `showModal()`, so the rest
 of the page is inert rather than merely covered, and it is a keyboard trap
 while open — it takes focus when it opens, `Tab` and `Shift+Tab` cycle inside
@@ -263,9 +277,9 @@ All configuration is via environment variables, read once at startup. **Invalid 
 | `PORT` | HTTP listen port | `3000` |
 | `DATABASE_URL` | sqlx connection string (not a file path) | `sqlite:stellargate.db` |
 | `STELLAR_NETWORK` | `testnet` or `public` | `testnet` |
-| `STELLAR_HORIZON_URL` | Horizon endpoint | testnet Horizon |
+| `STELLAR_HORIZON_URL` | Horizon endpoint. Defaults to match `STELLAR_NETWORK`: `https://horizon.stellar.org` on `public`, `https://horizon-testnet.stellar.org` otherwise. On `public`, a testnet Horizon URL aborts boot; on `testnet`, the mainnet Horizon logs a warning (issue #969). | per `STELLAR_NETWORK` (see description) |
 | `STELLAR_GATEWAY_PUBLIC` | Gateway wallet public key (`G…`), validated as a strkey at startup. The listener stays idle until this is set. | — |
-| `ACCEPTED_ASSETS` | Comma-separated. Only native XLM may be written as a bare `CODE`. Every other asset is `CODE:ISSUER` (`USDC:GA…`). A typo like `ACCEPTED_ASSETS=XLM,USDC` used to treat native XLM as settling USDC intents; boot now refuses it (issue #221). Duplicate codes are also refused (issue #222). Each issuer is strkey-validated. Adding an asset is config-only — but see [Trustlines](#trustlines). | `XLM,USDC:<testnet issuer>` |
+| `ACCEPTED_ASSETS` | Comma-separated. Only native XLM may be written as a bare `CODE`. Every other asset is `CODE:ISSUER` (`USDC:GA…`). A typo like `ACCEPTED_ASSETS=XLM,USDC` used to treat native XLM as settling USDC intents; boot now refuses it (issue #221). Duplicate codes are also refused (issue #222). Each issuer is strkey-validated. Adding an asset is config-only — but see [Trustlines](#trustlines). | `XLM,USDC:<testnet issuer>` on `testnet`; `XLM` only on `public` (the testnet USDC issuer is never accepted by default on mainnet — set `ACCEPTED_ASSETS` explicitly to accept a mainnet asset) |
 | `REQUEST_TIMEOUT_SECS` | Whole-request timeout; exceeding it returns `408` | `30` |
 | `MAX_PAYMENT_AMOUNT` | Maximum amount `POST /payments` accepts, in the asset's own units. A bare number (`100000`) applies to every asset; `CODE:AMOUNT` (`USDC:50000`) pins a bound to one asset specifically and always wins over the default; mix both with commas (`100000,USDC:50000`). Exceeding it returns `400 amount_out_of_range` naming the configured limit — distinct from `invalid_amount`, which means the value itself is malformed. Unset means no bound beyond `i64` overflow in `parse_stroops` (issue #310). | unset |
 | `MIN_PAYMENT_AMOUNT` | Minimum amount, configured the same way as `MAX_PAYMENT_AMOUNT`. Boot refuses a configuration where an asset's effective minimum exceeds its effective maximum. | unset |
@@ -444,7 +458,7 @@ skipped are logged at `info` on every first run.
 | Variable | Description | Default |
 |---|---|---|
 | `WEBHOOK_SECRET` | HMAC-SHA256 signing secret. Must be **≥ 32 characters**; known placeholder values are rejected at boot. | — |
-| `ALLOWED_WEBHOOK_SCHEMES` | Comma-separated URL schemes accepted for `webhook_url`. HTTPS is enforced on `public` regardless of this value. | `https` |
+| `ALLOWED_WEBHOOK_SCHEMES` | Comma-separated URL schemes accepted for `webhook_url`; only `http` and `https` are allowed, case-insensitively (`HTTPS` is fine). Any other scheme, or an empty list, aborts boot (issue #971). HTTPS is enforced on `public` regardless of this value. | `https` |
 | `WEBHOOK_RETRY_ATTEMPTS` | Inline delivery attempts | `3` |
 | `WEBHOOK_RETRY_DELAY_MS` | **Base** delay between inline retries — the first step of an exponential, jittered schedule, not a fixed interval | `5000` |
 | `WEBHOOK_RETRY_MAX_DELAY_MS` | Ceiling on one inline retry delay. Must be `≥` `WEBHOOK_RETRY_DELAY_MS`. | `60000` |
@@ -488,7 +502,7 @@ Recovers deliveries left `pending`/`failed` by a process that exited mid-send or
 |---|---|---|
 | `WEBHOOK_REDRIVE_INTERVAL_SECS` | Scan frequency | `30` |
 | `WEBHOOK_REDRIVE_CONCURRENCY` | Max redrive requests in flight | `4` |
-| `WEBHOOK_REDRIVE_MAX_ATTEMPTS` | Total attempts (inline + redrive) before a delivery is left permanently `failed` | `8` |
+| `WEBHOOK_REDRIVE_MAX_ATTEMPTS` | **Total** attempts (inline + redrive) before a delivery is left permanently `failed`. The count includes the `WEBHOOK_RETRY_ATTEMPTS` inline attempts, so it must be **greater than** `WEBHOOK_RETRY_ATTEMPTS` (validated at boot); at or below it, no inline-failed delivery is ever redriven. | `8` |
 | `WEBHOOK_REDRIVE_GRACE_SECS` | Idle time required before the worker touches a row, so it never races an in-flight inline delivery. Also the floor under the backoff. Must be `1..=86,400`. | `60` |
 | `WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS` | Exponential backoff base: `initial × 2^(attempts−1)`. A row never attempted is exempt and gated only by the grace window. Must be `0..=86,400`; `0` disables growth. | `30` |
 | `WEBHOOK_REDRIVE_BACKOFF_MAX_SECS` | Backoff ceiling. Must be `1..=86,400` and `≥` the initial value. | `900` |
@@ -531,7 +545,7 @@ until it finished; a backlog drains over several cycles instead.
 |---|---|---|
 | `ADMIN_PROVISIONING_SECRET` | Required via `X-Admin-Secret` to call `POST /merchants`. Unset disables provisioning entirely (always `401`). | _(unset — disabled)_ |
 | `METRICS_TOKEN` | Required via `Authorization: Bearer <token>` to call `GET /metrics`. Unset disables scraping entirely (always `401`) — the endpoint exposes auth outcome counters and webhook delivery volume, so it must not be reachable anonymously by default (issue #250). | _(unset — disabled)_ |
-| `CORS_ALLOWED_ORIGINS` | Comma-separated origins. **Required** on `public`; omitting on testnet falls back to permissive with a warning. | _(unset)_ |
+| `CORS_ALLOWED_ORIGINS` | Comma-separated origins, each in the browser `Origin` form `scheme://host[:port]` (e.g. `https://app.example.com`). A single trailing `/` is accepted. Paths, query strings, fragments, credentials, scheme-less hosts and `*` abort boot, naming the bad entry (issue #970). **Required** on `public`; omitting on testnet falls back to permissive with a warning. | _(unset)_ |
 | `RATE_LIMIT_REQUESTS_PER_SEC` | Base per-IP limit. Write routes get this rate; read-only routes get 5×. Must be `> 0` — boot fails otherwise; there is no "disabled" value. | `10` |
 | `TRUSTED_PROXY_CIDRS` | Comma-separated CIDR blocks whose `X-Forwarded-For`/`X-Real-IP` headers are honored for rate-limit bucketing and auth-log attribution. Every other peer is attributed by its own address and its headers are ignored — the safe default. | _(unset — headers ignored)_ |
 | `DB_POOL_MAX_CONNECTIONS` | SQLite pool size. WAL allows one writer plus many readers. | `10` |
