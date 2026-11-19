@@ -313,6 +313,7 @@ fn api_v1(
     goes on each `MethodRouter` for the same reason as the merchant auth layer
     below — a 405 on a known path stays a 405 rather than becoming a 401. */
     let admin_layer = || middleware::from_fn_with_state(state.clone(), require_admin_secret);
+    let auth_layer = || middleware::from_fn_with_state(state.clone(), auth_middleware);
     let merchants = axum::Router::new()
         .route("/", post(provision_merchant).route_layer(admin_layer()))
         .route(

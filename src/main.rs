@@ -27,7 +27,9 @@ const USER_AGENT: &str = concat!("StellarGate/", env!("CARGO_PKG_VERSION"));
 /// configurable per-attempt timeout instead.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Fallback overall shutdown deadline when `SHUTDOWN_GRACE_SECS` is unset.
+/// Overall shutdown deadline: the process exits after this even if HTTP or
+/// background tasks are still draining, so it stays within the orchestrator's
+/// stop grace period.
 const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 30;
 
 /// Timeout for the `healthcheck` subcommand's probe request. Kept short so a
@@ -105,37 +107,32 @@ async fn main() -> Result<()> {
     }
 
     let stream = (state.config.listener_mode == ListenerMode::Stream).then(|| {
-        supervise::supervise(
-            health.clone(),
-            "stream",
-            horizon::run_stream_listener(state.clone(), shutdown_rx.clone()),
-        )
+        supervise::supervise(health.clone(), "stream", shutdown_rx.clone(), {
+            let (state, rx) = (state.clone(), shutdown_rx.clone());
+            move || horizon::run_stream_listener(state.clone(), rx.clone())
+        })
     });
-    let poller = supervise::supervise(
-        health.clone(),
-        "poller",
-        horizon::run_poller(state.clone(), shutdown_rx.clone()),
-    );
-    let sweeper = supervise::supervise(
-        health.clone(),
-        "sweeper",
-        expiry::run_sweeper(state.clone(), shutdown_rx.clone()),
-    );
-    let retention = supervise::supervise(
-        health.clone(),
-        "retention",
-        retention::run_retention_worker(state.clone(), shutdown_rx.clone()),
-    );
-    let trustline_checker = supervise::supervise(
-        health.clone(),
-        "trustline_checker",
-        horizon::run_trustline_checker(state.clone(), shutdown_rx.clone()),
-    );
-    let redrive = supervise::supervise(
-        health.clone(),
-        "redrive",
-        webhook::run_redrive_worker(state.clone(), shutdown_rx),
-    );
+    let poller = supervise::supervise(health.clone(), "poller", shutdown_rx.clone(), {
+        let (state, rx) = (state.clone(), shutdown_rx.clone());
+        move || horizon::run_poller(state.clone(), rx.clone())
+    });
+    let sweeper = supervise::supervise(health.clone(), "sweeper", shutdown_rx.clone(), {
+        let (state, rx) = (state.clone(), shutdown_rx.clone());
+        move || expiry::run_sweeper(state.clone(), rx.clone())
+    });
+    let retention = supervise::supervise(health.clone(), "retention", shutdown_rx.clone(), {
+        let (state, rx) = (state.clone(), shutdown_rx.clone());
+        move || retention::run_retention_worker(state.clone(), rx.clone())
+    });
+    let trustline_checker =
+        supervise::supervise(health.clone(), "trustline_checker", shutdown_rx.clone(), {
+            let (state, rx) = (state.clone(), shutdown_rx.clone());
+            move || horizon::run_trustline_checker(state.clone(), rx.clone())
+        });
+    let redrive = supervise::supervise(health.clone(), "redrive", shutdown_rx.clone(), {
+        let (state, rx) = (state.clone(), shutdown_rx.clone());
+        move || webhook::run_redrive_worker(state.clone(), rx.clone())
+    });
 
     let addr = format!("0.0.0.0:{}", state.config.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -143,6 +140,7 @@ async fn main() -> Result<()> {
 
     // One overall deadline covers both the HTTP drain and the worker drain, so
     // the process can never overrun the orchestrator's stop grace period.
+    let shutdown_grace = Duration::from_secs(DEFAULT_SHUTDOWN_GRACE_SECS);
     let deadline = tokio::time::Instant::now() + shutdown_grace;
 
     // Signal the workers at the same time as the HTTP graceful shutdown starts
@@ -178,7 +176,12 @@ async fn main() -> Result<()> {
     };
 
     if tokio::time::timeout_at(deadline, shutdown).await.is_err() {
-        let running = health.running_tasks();
+        let running: Vec<String> = health
+            .snapshots()
+            .into_iter()
+            .filter(|task| task.running)
+            .map(|task| task.name)
+            .collect();
         warn!(
             timeout_secs = shutdown_grace.as_secs(),
             ?running,
@@ -327,13 +330,7 @@ mod tests {
 
     #[test]
     fn healthcheck_url_falls_back_to_default_path() {
-        assert_eq!(
-            healthcheck_url(3000, ""),
-            "http://127.0.0.1:3000/health"
-        );
-        assert_eq!(
-            healthcheck_url(3000, "/"),
-            "http://127.0.0.1:3000/health"
-        );
+        assert_eq!(healthcheck_url(3000, ""), "http://127.0.0.1:3000/health");
+        assert_eq!(healthcheck_url(3000, "/"), "http://127.0.0.1:3000/health");
     }
 }

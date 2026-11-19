@@ -491,7 +491,10 @@ fn every_dashboard_helper_the_script_calls_is_defined() {
 
 #[test]
 fn dashboard_print_styles_hide_chrome_and_keep_table_readable() {
-    assert!(DASHBOARD_CSS.contains("@media print"), "print styles must be defined");
+    assert!(
+        DASHBOARD_CSS.contains("@media print"),
+        "print styles must be defined"
+    );
     for needle in [
         ".topbar,",
         ".toolbar,",
