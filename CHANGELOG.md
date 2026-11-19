@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Poller and expiry sweeper run once at startup (#984).** Payments that
+  landed, and intents that expired, while the process was down are now
+  reconciled immediately instead of after `POLL_INTERVAL_SECS`.
+
+- **Trustline headroom warning fires at 10 units, as documented (#985).**
+  The threshold was 10,000,000 stroops (one unit); it is now
+  `10 * STROOPS_PER_UNIT`, matching the "~10 XLM-equivalent" comment.
+
+- **Trustline outcome is logged once per check (#986).** `check_trustlines`
+  is the only place that logs it, so a boot no longer prints the summary twice.
+
+- **Three Horizon metrics are now recorded (#987).**
+  `stellargate_horizon_cursor_age_seconds`,
+  `stellargate_horizon_records_skipped_total` (records without a transaction
+  hash), and `stellargate_horizon_repeated_cursor_4xx_total` were exported but
+  never written. Each is now updated by the code path it describes.
+
 - **Legacy processed-stroop tests now include descriptive failure context (#550-#553).**
   Replaced bare `unwrap()` calls with `expect()` messages describing the
   expected operation.
