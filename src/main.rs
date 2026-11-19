@@ -141,8 +141,8 @@ async fn main() -> Result<()> {
         webhook::run_redrive_worker(state.clone(), shutdown_rx),
     );
 
-    let addr = format!("0.0.0.0:{}", state.config.port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let addr = SocketAddr::new(state.config.bind_addr, state.config.port);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
     info!("StellarGate API listening on {addr}");
 
     // One overall deadline covers both the HTTP drain and the worker drain, so

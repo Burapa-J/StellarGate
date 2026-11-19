@@ -79,6 +79,7 @@ mod tests {
     fn test_config(webhook_url_allowed: bool) -> Config {
         Config {
             port: 0,
+            bind_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             database_url: "sqlite::memory:".into(),
             network: "testnet".into(),
             horizon_url: String::new(),

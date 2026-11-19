@@ -82,6 +82,10 @@ impl AcceptedAsset {
 #[derive(Clone)]
 pub struct Config {
     pub port: u16,
+    /// Address the HTTP listener binds to (`BIND_ADDR`, default `0.0.0.0`).
+    /// `127.0.0.1` keeps the API reachable only locally, e.g. behind a reverse
+    /// proxy on the same host; `::` listens on IPv6.
+    pub bind_addr: std::net::IpAddr,
     pub database_url: String,
     pub network: String,
     pub horizon_url: String,
@@ -318,6 +322,10 @@ impl Config {
 
         let config = Self {
             port: parse_env("PORT", 3000)?,
+            bind_addr: parse_env(
+                "BIND_ADDR",
+                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            )?,
             database_url,
             network,
             horizon_url,
@@ -825,6 +833,7 @@ mod tests {
     fn debug_redacts_secrets() {
         let cfg = Config {
             port: 3000,
+            bind_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             database_url: "sqlite:test.db".into(),
             network: "testnet".into(),
             horizon_url: "https://horizon-testnet.stellar.org".into(),
@@ -909,6 +918,7 @@ mod tests {
     fn sample_config() -> Config {
         Config {
             port: 3000,
+            bind_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             database_url: "sqlite::memory:".into(),
             network: "testnet".into(),
             horizon_url: "https://horizon-testnet.stellar.org".into(),
@@ -1388,6 +1398,73 @@ mod tests {
         assert!(
             err.contains("streem"),
             "error should echo the bad value; got: {err}"
+        );
+    }
+
+    // ── BIND_ADDR (issue #967) ───────────────────────────────────────────────
+
+    #[test]
+    fn bind_addr_defaults_to_all_ipv4_interfaces() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("BIND_ADDR", None),
+            ],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert_eq!(
+                    cfg.bind_addr,
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn bind_addr_accepts_loopback_and_ipv6() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("BIND_ADDR", Some("127.0.0.1")),
+            ],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert_eq!(
+                    cfg.bind_addr,
+                    "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
+                );
+            },
+        );
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("BIND_ADDR", Some("::")),
+            ],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert!(cfg.bind_addr.is_ipv6(), "BIND_ADDR=:: must select IPv6");
+            },
+        );
+    }
+
+    #[test]
+    fn bind_addr_invalid_value_aborts_boot() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("BIND_ADDR", Some("localhost")),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(
+                    err.contains("BIND_ADDR"),
+                    "error should name the variable; got: {err}"
+                );
+                assert!(
+                    err.contains("localhost"),
+                    "error should echo the value; got: {err}"
+                );
+            },
         );
     }
 
