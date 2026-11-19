@@ -286,3 +286,40 @@ test("filterPayments tolerates malformed rows", () => {
   assert.deepEqual(filterPayments([{}, null], "x"), []);
   assert.deepEqual(filterPayments(undefined, "x"), []);
 });
+
+/* ── #781–#784 helpers ─────────────────────────────────────────────────── */
+import { compareDecimal, filterByAmount, formatAmountLocale, isoInZone, newPaymentIds } from "../format.js";
+
+test("compareDecimal is exact for long decimals", () => {
+  assert.equal(compareDecimal("0.1234567", "0.12345670"), 0);
+  assert.equal(compareDecimal("9007199254740993", "9007199254740992"), 1);
+  assert.equal(compareDecimal("2", "10"), -1);
+  assert.equal(compareDecimal("-1", "1"), -1);
+  assert.ok(Number.isNaN(compareDecimal("abc", "1")));
+});
+
+test("filterByAmount applies inclusive bounds and ignores blank/invalid", () => {
+  const rows = [{ amount: "1.0000000" }, { amount: "5.5" }, { amount: "10" }];
+  assert.equal(filterByAmount(rows, "1", "5.5").length, 2);
+  assert.equal(filterByAmount(rows, "", "").length, 3);
+  assert.equal(filterByAmount(rows, "x", "").length, 3);
+  assert.equal(filterByAmount(rows, "5.5000001", "").length, 1);
+});
+
+test("newPaymentIds returns ids not seen before", () => {
+  assert.deepEqual(newPaymentIds({ a: true }, [{ id: "a" }, { id: "b" }]), ["b"]);
+});
+
+test("formatAmountLocale groups and localises, keeping precision", () => {
+  assert.equal(formatAmountLocale("1234567.1000000", "XLM", "en-US"), "1,234,567.1 XLM");
+  assert.equal(formatAmountLocale("1234.5", "USDC", "de-DE"), "1.234,5 USDC");
+  assert.equal(formatAmountLocale("0.1234567", "XLM", "en-US"), "0.1234567 XLM");
+  assert.equal(formatAmountLocale("oops", "XLM", "en-US"), "oops XLM");
+});
+
+test("isoInZone and fmtTime honour the zone", () => {
+  assert.equal(isoInZone("2024-01-02T03:04:05.000Z", "utc"), "2024-01-02T03:04:05Z");
+  assert.match(isoInZone("2024-01-02T03:04:05Z", "local"), /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d\d:\d\d$/);
+  assert.ok(fmtTime("2024-01-02T03:04:05Z", "utc").endsWith(" UTC"));
+  assert.ok(toCsv([{ created_at: "2024-01-02T03:04:05Z" }], ["created_at"], "utc").includes("2024-01-02T03:04:05Z"));
+});
