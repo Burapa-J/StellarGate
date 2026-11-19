@@ -1034,11 +1034,12 @@ async fn test_server() -> TestServer {
 const EXPECTED_CSP: &str = "default-src 'none'; \
      script-src 'self'; \
      style-src 'self'; \
-     img-src 'self' data:; \
+     img-src 'self'; \
      connect-src 'self'; \
      form-action 'none'; \
      frame-ancestors 'none'; \
-     base-uri 'none'";
+     base-uri 'none'; \
+     require-trusted-types-for 'script'";
 
 /// Every dashboard asset must be served with its exact content type, the full
 /// CSP, and the baseline security headers the outer layers add (#637).
@@ -1296,4 +1297,33 @@ fn table_rows_use_content_visibility_for_responsiveness() {
          each row is a stack of labelled cells rather than a single-line table \
          row (#805)"
     );
+}
+
+/// The favicon is a routed static file, so the CSP needs neither `data:` in
+/// `img-src` (#798) nor an inline icon in the page, and Trusted Types are
+/// enforced for script sinks (#799).
+#[tokio::test]
+async fn favicon_is_served_and_csp_is_tight() {
+    let server = test_server().await;
+
+    let res = server.get("/dashboard/favicon.svg").await;
+    res.assert_status_ok();
+    assert_eq!(res.header("content-type"), "image/svg+xml");
+    let csp = res.header("content-security-policy").to_str().unwrap().to_owned();
+    assert!(!csp.contains("data:"), "CSP must not allow data: URIs: {csp}");
+    assert!(csp.contains("require-trusted-types-for 'script'"), "{csp}");
+    assert!(DASHBOARD_HTML.contains("/dashboard/favicon.svg"));
+    assert!(!DASHBOARD_HTML.contains("data:image"));
+}
+
+/// Sign-out must empty the DOM containers that held payment data (#797).
+#[test]
+fn sign_out_wipes_payment_data() {
+    let start = DASHBOARD_JS.find("function wipePaymentData").expect("wipe fn");
+    let body = &DASHBOARD_JS[start..start + 900];
+    for id in ["rows", "summary", "detail-fields", "deliveries"] {
+        assert!(body.contains(&format!("\"{id}\"")), "{id} not wiped");
+    }
+    assert!(DASHBOARD_JS.contains("loadedPayments: []"));
+    assert!(DASHBOARD_JS.contains("wipePaymentData();"));
 }
