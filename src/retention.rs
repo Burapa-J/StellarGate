@@ -142,6 +142,8 @@ mod tests {
             webhook_delivery_retention_days: delivery_days,
             idempotency_retention_days: idempotency_days,
             poll_interval_secs: 10,
+            expiry_sweep_interval_secs: 10,
+            trustline_check_interval_secs: 3600,
             poll_max_pages_per_cycle: 50,
             payment_ttl_secs: 3600,
             rate_limit_requests_per_sec: 1000,
@@ -205,9 +207,7 @@ mod tests {
             .expect("pending delivery count should load from sqlite");
         }
 
-        let (deliveries, _) = prune_once(&state)
-            .await
-            .expect("prune_once should succeed");
+        let (deliveries, _) = prune_once(&state).await.expect("prune_once should succeed");
         assert_eq!(deliveries, 2, "both aged terminal rows should go");
 
         let left: Vec<String> = sqlx::query_scalar("SELECT id FROM webhook_deliveries ORDER BY id")

@@ -859,7 +859,7 @@ pub async fn check_trustlines(state: &Arc<AppState>) -> anyhow::Result<Vec<Strin
     Ok(missing_codes)
 }
 
-/// Background task that re-runs [`check_trustlines`] on `RETENTION_INTERVAL_SECS`
+/// Background task that re-runs [`check_trustlines`] on `TRUSTLINE_CHECK_INTERVAL_SECS`
 /// for as long as the gateway wallet is configured — a trustline can be
 /// revoked, or an asset added to `ACCEPTED_ASSETS`, at any time after boot, so
 /// a boot-only check would go stale the moment either happens.
@@ -873,9 +873,9 @@ pub async fn run_trustline_checker(
         );
     }
 
-    let interval = Duration::from_secs(state.config.retention_interval_secs.max(1));
+    let interval = Duration::from_secs(state.config.trustline_check_interval_secs.max(1));
     info!(
-        interval_secs = state.config.retention_interval_secs,
+        interval_secs = state.config.trustline_check_interval_secs,
         "trustline checker started"
     );
 

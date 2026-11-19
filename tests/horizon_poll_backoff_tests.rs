@@ -70,6 +70,8 @@ async fn make_state(horizon_url: String) -> Arc<AppState> {
             webhook_delivery_retention_days: 30,
             idempotency_retention_days: 7,
             poll_interval_secs: 10,
+            expiry_sweep_interval_secs: 10,
+            trustline_check_interval_secs: 3600,
             poll_max_pages_per_cycle: 25,
             payment_ttl_secs: 3600,
             rate_limit_requests_per_sec: 10000,

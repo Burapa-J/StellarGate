@@ -154,6 +154,14 @@ pub struct Config {
     /// pruning.
     pub idempotency_retention_days: i64,
     pub poll_interval_secs: u64,
+    /// How often (seconds) the expiry sweeper transitions overdue `pending`
+    /// intents to `expired`. Independent of `POLL_INTERVAL_SECS`; defaults to
+    /// it so existing deployments keep today's behaviour.
+    pub expiry_sweep_interval_secs: u64,
+    /// How often (seconds) the trustline checker re-verifies that every
+    /// accepted asset still has a trustline on the gateway account. Independent
+    /// of `RETENTION_INTERVAL_SECS` and `POLL_INTERVAL_SECS`.
+    pub trustline_check_interval_secs: u64,
     /// Maximum number of Horizon pages a single poll cycle will walk before it
     /// yields and waits for the next tick. Bounds how long one cycle can
     /// monopolise the poller task while catching up on a large backlog; the
@@ -316,6 +324,7 @@ impl Config {
             Self::validate_admin_secret(std::env::var("ADMIN_PROVISIONING_SECRET"))?;
         let metrics_token = Self::validate_metrics_token(std::env::var("METRICS_TOKEN"))?;
 
+        let poll_interval_secs: u64 = parse_env("POLL_INTERVAL_SECS", 10)?;
         let config = Self {
             port: parse_env("PORT", 3000)?,
             database_url,
@@ -348,7 +357,12 @@ impl Config {
             retention_interval_secs: parse_env("RETENTION_INTERVAL_SECS", 3600)?,
             webhook_delivery_retention_days: parse_env("WEBHOOK_DELIVERY_RETENTION_DAYS", 30)?,
             idempotency_retention_days: parse_env("IDEMPOTENCY_RETENTION_DAYS", 7)?,
-            poll_interval_secs: parse_env("POLL_INTERVAL_SECS", 10)?,
+            poll_interval_secs,
+            expiry_sweep_interval_secs: parse_env(
+                "EXPIRY_SWEEP_INTERVAL_SECS",
+                poll_interval_secs,
+            )?,
+            trustline_check_interval_secs: parse_env("TRUSTLINE_CHECK_INTERVAL_SECS", 3600)?,
             poll_max_pages_per_cycle: parse_env("POLL_MAX_PAGES_PER_CYCLE", 50)?,
             payment_ttl_secs: parse_env("PAYMENT_TTL_SECS", 3600)?,
             rate_limit_requests_per_sec: parse_env("RATE_LIMIT_REQUESTS_PER_SEC", 10)?,
@@ -420,6 +434,20 @@ impl Config {
     ///   → the cap would silently override the starting delay, so backoff
     ///   never actually grows
     fn validate_timing(&self) -> Result<()> {
+        if self.expiry_sweep_interval_secs == 0 {
+            return Err(anyhow::anyhow!(
+                "EXPIRY_SWEEP_INTERVAL_SECS must be > 0 (got 0). \
+                 A zero interval creates a tight sweep loop at 100% CPU."
+            ));
+        }
+
+        if self.trustline_check_interval_secs == 0 {
+            return Err(anyhow::anyhow!(
+                "TRUSTLINE_CHECK_INTERVAL_SECS must be > 0 (got 0). \
+                 A zero interval creates a tight Horizon-polling loop."
+            ));
+        }
+
         if self.poll_interval_secs == 0 {
             return Err(anyhow::anyhow!(
                 "POLL_INTERVAL_SECS must be > 0 (got 0). \
@@ -750,6 +778,14 @@ impl std::fmt::Debug for Config {
                 &self.webhook_redrive_backoff_max_secs,
             )
             .field("poll_interval_secs", &self.poll_interval_secs)
+            .field(
+                "expiry_sweep_interval_secs",
+                &self.expiry_sweep_interval_secs,
+            )
+            .field(
+                "trustline_check_interval_secs",
+                &self.trustline_check_interval_secs,
+            )
             .field("poll_max_pages_per_cycle", &self.poll_max_pages_per_cycle)
             .field("payment_ttl_secs", &self.payment_ttl_secs)
             .field(
@@ -846,6 +882,8 @@ mod tests {
             webhook_delivery_retention_days: 30,
             idempotency_retention_days: 7,
             poll_interval_secs: 10,
+            expiry_sweep_interval_secs: 10,
+            trustline_check_interval_secs: 3600,
             poll_max_pages_per_cycle: 50,
             payment_ttl_secs: 3600,
             rate_limit_requests_per_sec: 10,
@@ -930,6 +968,8 @@ mod tests {
             webhook_delivery_retention_days: 30,
             idempotency_retention_days: 7,
             poll_interval_secs: 10,
+            expiry_sweep_interval_secs: 10,
+            trustline_check_interval_secs: 3600,
             poll_max_pages_per_cycle: 50,
             payment_ttl_secs: 3600,
             rate_limit_requests_per_sec: 10,
