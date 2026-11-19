@@ -240,12 +240,16 @@ impl HorizonPayment {
     /// with one of our hex memos as plain text, so the type must be checked;
     /// otherwise an unrelated `memo_id` payment could be mistaken for one of
     /// ours.
-    fn memo(&self) -> Option<&str> {
+    ///
+    /// The text is normalised with [`normalize_memo`]: payers often type the
+    /// memo by hand, so surrounding whitespace and lower case must not stop a
+    /// real payment from matching its intent (issue #981).
+    fn memo(&self) -> Option<String> {
         let t = self.transaction.as_ref()?;
         if t.memo_type.as_deref() != Some("text") {
             return None;
         }
-        t.memo.as_deref()
+        normalize_memo(t.memo.as_deref()?)
     }
 
     /// Whether the transaction that carried this payment is known to have
@@ -316,6 +320,35 @@ pub struct IntentMatch {
     pub new_stroops: i64,
 }
 
+/// Whether a Horizon operation type carries a payment to its `to` account that
+/// can settle an intent.
+///
+/// Besides plain `payment` operations this includes both path-payment kinds.
+/// Wallets and exchanges send these when the payer converts on the way (for
+/// example, paying in XLM while the gateway receives USDC). For these
+/// operations Horizon's `amount` and `asset_*` describe what the destination
+/// received, which is exactly what must match the intent (issue #980).
+pub fn is_payment_operation(kind: &str) -> bool {
+    matches!(
+        kind,
+        "payment" | "path_payment_strict_receive" | "path_payment_strict_send"
+    )
+}
+
+/// Canonicalise a payer-typed text memo for comparison with an intent's memo.
+///
+/// Trims surrounding whitespace and upper-cases the text, so `ab12cd34` and
+/// ` AB12CD34 ` both match intent `AB12CD34`. Intent memos are always
+/// upper-case hex, so this cannot make two different intents collide. Empty
+/// text can never match an intent and returns `None` (issue #981).
+pub fn normalize_memo(raw: &str) -> Option<String> {
+    let memo = raw.trim().to_ascii_uppercase();
+    if memo.is_empty() {
+        return None;
+    }
+    Some(memo)
+}
+
 /// Return the parsed amount when a Horizon payment belongs to this intent.
 /// Unrelated, unsuccessful, wrong-destination/memo/asset, or malformed records
 /// return `None` and must not enter the authoritative processed-transaction
@@ -323,13 +356,13 @@ pub struct IntentMatch {
 /// terminal) intent's own recorded `asset`/`asset_issuer` rather than the
 /// current `accepted_assets` allow-list.
 pub fn matches_intent(payment: &db::Payment, hp: &HorizonPayment) -> Option<IntentMatch> {
-    if hp.kind != "payment" {
+    if !is_payment_operation(&hp.kind) {
         return None;
     }
     if hp.to.as_deref() != Some(payment.destination_address.as_str()) {
         return None;
     }
-    if hp.memo() != Some(payment.memo.as_str()) {
+    if hp.memo().as_deref() != Some(payment.memo.as_str()) {
         return None;
     }
     /* Only settle against a transaction Horizon reports as successful. Matching
@@ -375,13 +408,13 @@ pub fn verify(
     accepted_assets: &[crate::config::AcceptedAsset],
     already_paid_stroops: i64,
 ) -> Option<Verdict> {
-    if hp.kind != "payment" {
+    if !is_payment_operation(&hp.kind) {
         return None;
     }
     if hp.to.as_deref() != Some(payment.destination_address.as_str()) {
         return None;
     }
-    if hp.memo() != Some(payment.memo.as_str()) {
+    if hp.memo().as_deref() != Some(payment.memo.as_str()) {
         return None;
     }
     /* Only settle against a transaction Horizon reports as successful. Matching
@@ -1149,14 +1182,14 @@ pub async fn reconcile_payment(state: &Arc<AppState>, hp: &HorizonPayment) -> an
     };
 
     // Fast path: find a still-active (pending/underpaid) intent.
-    if let Some(payment) = db::find_pending_by_memo(&state.pool, memo).await? {
+    if let Some(payment) = db::find_pending_by_memo(&state.pool, &memo).await? {
         return reconcile_active_payment(state, hp, payment).await;
     }
 
     // Slow path: the memo matched no active intent. Check whether it matches a
     // terminal one — a customer who pays after completion/expiry has lost real
     // funds that the gateway is the only component that can see (issue #232).
-    if let Some(payment) = db::find_by_memo_any_status(&state.pool, memo).await? {
+    if let Some(payment) = db::find_by_memo_any_status(&state.pool, &memo).await? {
         // Only act on terminal intents (completed/expired). An underpaid intent
         // that somehow slipped through the active check (extremely unlikely) is
         // simply left alone.
@@ -2002,6 +2035,74 @@ mod tests {
     /// A transaction Horizon reports as `successful: false` must never settle an
     /// intent, even when type/destination/memo/asset/amount all match.
     #[test]
+    fn path_payment_strict_send_settles_intent() {
+        let p = pending("XLM", "10");
+        let mut hp = native_payment("10", "MEMO1234", "GGATEWAY");
+        hp.kind = "path_payment_strict_send".into();
+        assert!(matches!(
+            verify(&p, &hp, &test_assets(), 0),
+            Some(Verdict::Completed { .. })
+        ));
+        assert!(matches_intent(&p, &hp).is_some());
+    }
+
+    #[test]
+    fn path_payment_strict_receive_settles_intent() {
+        let p = pending("XLM", "10");
+        let mut hp = native_payment("10", "MEMO1234", "GGATEWAY");
+        hp.kind = "path_payment_strict_receive".into();
+        assert!(matches!(
+            verify(&p, &hp, &test_assets(), 0),
+            Some(Verdict::Completed { .. })
+        ));
+    }
+
+    /// A path payment is judged on what the destination received, so one that
+    /// delivers a different asset than the intent's must still be rejected.
+    #[test]
+    fn path_payment_in_wrong_destination_asset_is_rejected() {
+        let p = pending("XLM", "10");
+        let mut hp = native_payment("10", "MEMO1234", "GGATEWAY");
+        hp.kind = "path_payment_strict_send".into();
+        hp.asset_type = Some("credit_alphanum4".into());
+        hp.asset_code = Some("USDC".into());
+        hp.asset_issuer = Some("GISSUER".into());
+        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
+        assert!(matches_intent(&p, &hp).is_none());
+    }
+
+    #[test]
+    fn memo_matches_regardless_of_case_and_surrounding_spaces() {
+        let mut p = pending("XLM", "10");
+        p.memo = "AB12CD34".into();
+        for typed in ["ab12cd34", " AB12CD34 ", "Ab12cD34\n"] {
+            let hp = native_payment("10", typed, "GGATEWAY");
+            assert!(
+                matches!(
+                    verify(&p, &hp, &test_assets(), 0),
+                    Some(Verdict::Completed { .. })
+                ),
+                "memo {typed:?} should settle AB12CD34"
+            );
+        }
+    }
+
+    #[test]
+    fn blank_memo_never_matches() {
+        let p = pending("XLM", "10");
+        let hp = native_payment("10", "   ", "GGATEWAY");
+        assert_eq!(hp.memo(), None);
+        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
+    }
+
+    #[test]
+    fn normalize_memo_trims_and_uppercases() {
+        assert_eq!(normalize_memo(" ab12cd34 "), Some("AB12CD34".to_string()));
+        assert_eq!(normalize_memo("AB12CD34"), Some("AB12CD34".to_string()));
+        assert_eq!(normalize_memo("  "), None);
+    }
+
+    #[test]
     fn failed_transaction_is_ignored() {
         let p = pending("XLM", "10");
         let mut hp = native_payment("10.0000000", "MEMO1234", "GGATEWAY");
@@ -2199,7 +2300,7 @@ mod tests {
         let page: PaymentsPage =
             serde_json::from_str(body).expect("Horizon payments page JSON should deserialize");
         assert_eq!(page.embedded.records.len(), 1);
-        assert_eq!(page.embedded.records[0].memo(), Some("MEMO1234"));
+        assert_eq!(page.embedded.records[0].memo().as_deref(), Some("MEMO1234"));
         assert_eq!(
             page.embedded.records[0].paging_token.as_deref(),
             Some("123456789-1")
