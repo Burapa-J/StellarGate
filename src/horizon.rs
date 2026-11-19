@@ -53,6 +53,7 @@
 //! The matching logic in [`verify`] is pure and unit-tested; the networked
 //! functions wrap it with I/O.
 
+use crate::supervise::TaskExit;
 use crate::{AppState, db, money, webhook};
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -1488,10 +1489,10 @@ fn next_poll_delay(consecutive_failures: u32, retry_after: Option<Duration>) -> 
 /// backs off for at least `Retry-After`, and repeated failures of any kind
 /// back off exponentially with jitter, both reset to the configured interval
 /// by the next success.
-pub async fn run_poller(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
+pub async fn run_poller(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) -> TaskExit {
     if !state.config.gateway_configured() {
         warn!("STELLAR_GATEWAY_PUBLIC is unconfigured; Horizon poller disabled");
-        return;
+        return TaskExit::DisabledByConfig("STELLAR_GATEWAY_PUBLIC is unconfigured");
     }
 
     let interval = Duration::from_secs(state.config.poll_interval_secs.max(1));
@@ -1509,7 +1510,7 @@ pub async fn run_poller(state: Arc<AppState>, mut shutdown: watch::Receiver<bool
             _ = tokio::time::sleep(next_delay) => {}
             _ = shutdown.changed() => {
                 info!("Horizon poller shutting down");
-                return;
+                return TaskExit::ShutdownRequested;
             }
         }
 
@@ -1589,10 +1590,13 @@ fn parse_sse_block(block: &str) -> SseEvent {
 /// automatically with exponential backoff, resuming from the last seen cursor
 /// so no payments are missed across a dropped connection. Idles (without
 /// connecting) while no gateway is configured.
-pub async fn run_stream_listener(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
+pub async fn run_stream_listener(
+    state: Arc<AppState>,
+    mut shutdown: watch::Receiver<bool>,
+) -> TaskExit {
     if !state.config.gateway_configured() {
         warn!("STELLAR_GATEWAY_PUBLIC is unconfigured; Horizon stream listener disabled");
-        return;
+        return TaskExit::DisabledByConfig("STELLAR_GATEWAY_PUBLIC is unconfigured");
     }
 
     info!(account = %state.config.gateway_public, "Horizon payment stream listener started");
@@ -1607,7 +1611,7 @@ pub async fn run_stream_listener(state: Arc<AppState>, mut shutdown: watch::Rece
         Ok(c) => c,
         Err(e) => {
             warn!(error = %e, "failed to build stream HTTP client; stream listener disabled");
-            return;
+            return TaskExit::Fatal(format!("failed to build stream HTTP client: {e}"));
         }
     };
 
@@ -1639,7 +1643,7 @@ pub async fn run_stream_listener(state: Arc<AppState>, mut shutdown: watch::Rece
             }
             _ = shutdown.changed() => {
                 info!("Horizon stream listener shutting down");
-                return;
+                return TaskExit::ShutdownRequested;
             }
         }
 
@@ -1651,7 +1655,7 @@ pub async fn run_stream_listener(state: Arc<AppState>, mut shutdown: watch::Rece
             _ = tokio::time::sleep(backoff) => {}
             _ = shutdown.changed() => {
                 info!("Horizon stream listener shutting down");
-                return;
+                return TaskExit::ShutdownRequested;
             }
         }
         backoff = (backoff * 2).min(max_backoff);

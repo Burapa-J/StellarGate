@@ -47,6 +47,7 @@ async fn make_state(horizon_url: String, stream_idle_timeout_secs: u64) -> Arc<A
         pool,
         config: Config {
             port: 0,
+            bind_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             database_url: "sqlite::memory:".into(),
             network: "testnet".into(),
             horizon_url,

@@ -75,6 +75,7 @@ fn make_state(pool: db::Db, webhook_url: Option<String>) -> Arc<AppState> {
         pool,
         config: Config {
             port: 0,
+            bind_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             database_url: "sqlite::memory:".into(),
             network: "testnet".into(),
             horizon_url: String::new(),

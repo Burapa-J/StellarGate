@@ -329,7 +329,10 @@ async fn deleting_payment_cascades_to_children() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(n, 0, "deleting the payment must cascade to webhook_deliveries");
+    assert_eq!(
+        n, 0,
+        "deleting the payment must cascade to webhook_deliveries"
+    );
 }
 
 // ── production pool settings (issue #642) ────────────────────────────────────

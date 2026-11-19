@@ -38,6 +38,7 @@ fn shared_memory_dsn() -> String {
 fn make_config(horizon_url: &str) -> Config {
     Config {
         port: 0,
+        bind_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
         database_url: shared_memory_dsn(),
         network: "testnet".into(),
         horizon_url: horizon_url.into(),
