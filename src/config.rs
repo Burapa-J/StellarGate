@@ -1369,7 +1369,11 @@ mod tests {
     #[test]
     fn listener_mode_stream_parses() {
         assert_eq!(ListenerMode::parse("stream").unwrap(), ListenerMode::Stream);
-        assert_eq!(ListenerMode::parse("STREAM").unwrap(), ListenerMode::Stream);
+        assert_eq!(
+            ListenerMode::parse("STREAM")
+                .expect("\"STREAM\" should parse as a valid listener mode"),
+            ListenerMode::Stream
+        );
     }
 
     #[test]
