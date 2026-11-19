@@ -241,7 +241,11 @@ impl TaskHealth {
 
     /// Names of required tasks that are not currently running.
     pub fn dead_required_tasks(&self) -> Vec<&'static str> {
-        let required = self.inner.required.lock().unwrap_or_else(|e| e.into_inner());
+        let required = self
+            .inner
+            .required
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tasks = self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner());
         required
             .iter()
@@ -253,7 +257,11 @@ impl TaskHealth {
     /// Names of required tasks that are crash-looping (consecutive failures
     /// at or above [`CRASH_LOOP_THRESHOLD`]).
     pub fn crash_looping_required_tasks(&self) -> Vec<&'static str> {
-        let required = self.inner.required.lock().unwrap_or_else(|e| e.into_inner());
+        let required = self
+            .inner
+            .required
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tasks = self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner());
         required
             .iter()
@@ -284,7 +292,11 @@ impl TaskHealth {
 
     /// Snapshot of every known task, for `/metrics`.
     pub fn snapshots(&self) -> Vec<TaskSnapshot> {
-        let required = self.inner.required.lock().unwrap_or_else(|e| e.into_inner());
+        let required = self
+            .inner
+            .required
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tasks = self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner());
         tasks
             .iter()
