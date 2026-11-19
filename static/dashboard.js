@@ -86,6 +86,22 @@ import { sortPayments } from "./sort.js";
     if (node) node.hidden = !visible;
   }
 
+  /* The one markup sink (#799). With `require-trusted-types-for 'script'` a
+     plain string assigned to innerHTML throws, so the vendored QR encoder's
+     output goes through a named policy. API fields never reach this path. */
+  var qrPolicy = null;
+  function setTrustedSvg(node, markup) {
+    if (!node) return;
+    clear(node);
+    if (!markup) return;
+    if (window.trustedTypes && !qrPolicy) {
+      qrPolicy = window.trustedTypes.createPolicy("stellargate-qr", {
+        createHTML: function (s) { return s; },
+      });
+    }
+    node.innerHTML = qrPolicy ? qrPolicy.createHTML(markup) : markup;
+  }
+
   function clear(node) {
     if (!node) return;
     while (node.firstChild) node.removeChild(node.firstChild);
@@ -517,11 +533,40 @@ import { sortPayments } from "./sort.js";
   // ── Session ───────────────────────────────────────────────────────────────
 
   function showGate(message) {
-    store.update({ key: null, selectedPaymentId: null, activeRow: -1 });
+    store.update({
+      key: null,
+      selectedPaymentId: null,
+      activeRow: -1,
+      loadedPayments: [],
+      cursor: null,
+      loading: false,
+    });
     closeDetail();
+    wipePaymentData();
     show($("app"), false);
     show($("gate"), true);
     setError($("gate-error"), message || null);
+  }
+
+  /** Empty every container that can hold payment data (#797). Hidden is not
+   *  gone: a hidden table, summary or drawer would still be in the DOM. */
+  function wipePaymentData() {
+    ["rows", "summary", "detail-fields", "deliveries", "invoice-fields",
+      "invoice-qr", "instr-qr"].forEach(function (id) { clear($(id)); });
+    ["invoice-uri", "instr-qr-alt", "instr-destination", "instr-memo",
+      "instr-amount", "instr-asset", "instr-expiry", "instr-id", "rows-status",
+      "deliveries-error"].forEach(function (id) {
+      var n = $(id);
+      if (n) n.textContent = "";
+    });
+    show($("payment-invoice"), false);
+    clearListState();
+    currentDetailPayment = null;
+    watchedPayments = {};
+    if (autoRefreshTimer !== null) {
+      window.clearInterval(autoRefreshTimer);
+      autoRefreshTimer = null;
+    }
   }
 
   // ── Cross-tab sign-out (#795) ─────────────────────────────────────────────
@@ -1329,7 +1374,7 @@ import { sortPayments } from "./sort.js";
     clear($("invoice-qr"));
     if (typeof QRCode !== "undefined" && QRCode.toSvg) {
       // Only the vendored encoder's SVG is markup; API fields remain text.
-      $("invoice-qr").innerHTML = QRCode.toSvg(uri, { size: 220, margin: 4 }) || "";
+      setTrustedSvg($("invoice-qr"), QRCode.toSvg(uri, { size: 220, margin: 4 }));
     }
     $("payment-invoice").hidden = false;
     $("invoice-print").disabled = false;
@@ -1574,7 +1619,7 @@ import { sortPayments } from "./sort.js";
         if (svgMarkup) {
           /* We only set innerHTML on a div we own and control; the content
              comes from our own QR encoder, not from the API or user input. */
-          qrContainer.innerHTML = svgMarkup;
+          setTrustedSvg(qrContainer, svgMarkup);
         }
       }
       /* Text alternative always present (#763). */

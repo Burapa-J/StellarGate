@@ -270,6 +270,7 @@ fn dashboard_routes() -> axum::Router<Arc<AppState>> {
         .route("/dashboard", get(dashboard_html))
         .route("/dashboard/app.css", get(dashboard_css))
         .route("/dashboard/app.js", get(dashboard_js))
+        .route("/dashboard/favicon.svg", get(dashboard_favicon))
         .route("/dashboard/i18n.js", get(dashboard_i18n))
         .route("/dashboard/format.js", get(dashboard_format_js))
         /* The dashboard is split into DOM-free modules so their logic can be
@@ -1287,6 +1288,7 @@ const DASHBOARD_SESSION_JS: &str = include_str!("../../static/session.js");
 const DASHBOARD_STATE_JS: &str = include_str!("../../static/state.js");
 const DASHBOARD_KEYS_JS: &str = include_str!("../../static/keys.js");
 const DASHBOARD_QRCODE_JS: &str = include_str!("../../static/vendor/qrcode.js");
+const DASHBOARD_FAVICON: &str = include_str!("../../static/favicon.svg");
 const DASHBOARD_I18N_JS: &str = include_str!("../../static/i18n.js");
 const DASHBOARD_THEME_JS: &str = include_str!("../../static/dashboard-theme.js");
 
@@ -1296,11 +1298,12 @@ const DASHBOARD_THEME_JS: &str = include_str!("../../static/dashboard-theme.js")
 const DASHBOARD_CSP: &str = "default-src 'none'; \
      script-src 'self'; \
      style-src 'self'; \
-     img-src 'self' data:; \
+     img-src 'self'; \
      connect-src 'self'; \
      form-action 'none'; \
      frame-ancestors 'none'; \
-     base-uri 'none'";
+     base-uri 'none'; \
+     require-trusted-types-for 'script'";
 
 fn dashboard_asset(body: &'static str, content_type: &'static str, req: &HeaderMap) -> Response {
     use std::hash::{Hash, Hasher};
@@ -1372,6 +1375,10 @@ async fn dashboard_qrcode_js(headers: HeaderMap) -> Response {
 
 async fn dashboard_theme_js(headers: HeaderMap) -> Response {
     dashboard_asset(DASHBOARD_THEME_JS, "text/javascript; charset=utf-8", &headers)
+}
+
+async fn dashboard_favicon(headers: HeaderMap) -> Response {
+    dashboard_asset(DASHBOARD_FAVICON, "image/svg+xml", &headers)
 }
 
 async fn not_found() -> impl IntoResponse {
