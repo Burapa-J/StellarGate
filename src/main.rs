@@ -39,6 +39,11 @@ const HEALTHCHECK_DEFAULT_PATH: &str = "health";
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Load `.env` first so every setting in it is visible to the code below:
+    // `RUST_LOG` to the tracing filter (#965), and `PORT` to the `healthcheck`
+    // probe (#966). Variables already set in the process environment win.
+    dotenvy::dotenv().ok();
+
     // Handle the `healthcheck` subcommand before anything else: no config
     // loading, tracing init, DB open, migrations, Horizon calls, or port
     // binding. Container probes must not start a second server.
@@ -55,7 +60,6 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
-    dotenvy::dotenv().ok();
 
     let cfg = Config::from_env()?;
     // `open_pool` builds every connection through `db::connect_options`, which
