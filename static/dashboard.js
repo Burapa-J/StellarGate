@@ -468,7 +468,7 @@ import { sortPayments } from "./sort.js";
     var key = store.get().key;
     if (key) headers.Authorization = "Bearer " + key;
 
-    return fetch(API_BASE + path, { method: opts.method || "GET", headers: headers, body: opts.body || undefined }).then(
+    return fetch(API_BASE + path, { method: opts.method || "GET", headers: headers, body: opts.body || undefined, signal: opts.signal }).then(
       function (res) {
         if (res.status === 401) {
           signOut(t("error.rejected"));
@@ -523,6 +523,7 @@ import { sortPayments } from "./sort.js";
 
   var reloadPending = false;
   var autoRefreshTimer = null;
+  var listAbort = null;
 
   // ── Payment completion notifications (#814) ───────────────────────────────
 
@@ -583,13 +584,19 @@ import { sortPayments } from "./sort.js";
     var intervalMs = (prefs.get().refreshIntervalSec || 30) * 1000;
     autoRefreshTimer = window.setInterval(function () {
       var stateSnap = store.get();
-      if (stateSnap.key && stateSnap.autoRefresh && (!stateSnap.status || stateSnap.status === "pending")) {
+      if (navigator.onLine && stateSnap.key && stateSnap.autoRefresh && (!stateSnap.status || stateSnap.status === "pending")) {
         reload();
       }
     }, intervalMs);
   }
 
   function reload() {
+    if (listAbort) {
+      listAbort.abort();
+      listAbort = null;
+      store.update({ loading: false });
+      reloadPending = false;
+    }
     store.resetPaging();
     store.update({ loadedPayments: [] });
     clear($("rows"));
@@ -610,8 +617,11 @@ import { sortPayments } from "./sort.js";
     var isFirstPage = !state.cursor;
     if (isFirstPage) showSkeletonRows(5);
 
-    api(buildListQuery(state))
+    var controller = typeof AbortController === "function" ? new AbortController() : null;
+    listAbort = controller;
+    api(buildListQuery(state), { signal: controller ? controller.signal : undefined })
       .then(function (body) {
+        if (controller && controller.signal.aborted) return;
         clearSkeletonRows();
         var stamp = $("last-updated");
         if (stamp) stamp.textContent = "Last updated " + fmtTime(new Date().toISOString());
@@ -637,6 +647,7 @@ import { sortPayments } from "./sort.js";
         }
       })
       .catch(function (err) {
+        if (controller && controller.signal.aborted) return;
         clearSkeletonRows();
         if (err.message !== "unauthorized") {
           setListState(buildErrorState(err.message, function () {
@@ -646,6 +657,8 @@ import { sortPayments } from "./sort.js";
         }
       })
       .then(function () {
+        if (controller && controller.signal.aborted) return;
+        listAbort = null;
         store.update({ loading: false });
         if (reloadPending) {
           reloadPending = false;
@@ -1611,7 +1624,17 @@ import { sortPayments } from "./sort.js";
     syncPresetUi();
   }
 
+  var FILTER_DEBOUNCE_MS = 300;
+  var filterTimer = null;
+
+  /** Coalesce rapid date edits into a single request (#804). */
+  function onFilterChangeDebounced() {
+    window.clearTimeout(filterTimer);
+    filterTimer = window.setTimeout(onFilterChange, FILTER_DEBOUNCE_MS);
+  }
+
   function onFilterChange() {
+    window.clearTimeout(filterTimer);
     syncFilterUi();
     writeHash();
     reload();
@@ -1756,12 +1779,12 @@ import { sortPayments } from "./sort.js";
 
     $("created-after").addEventListener("change", function () {
       store.update({ createdAfter: $("created-after").value });
-      onFilterChange();
+      onFilterChangeDebounced();
     });
 
     $("created-before").addEventListener("change", function () {
       store.update({ createdBefore: $("created-before").value });
-      onFilterChange();
+      onFilterChangeDebounced();
     });
 
     $("auto-refresh").addEventListener("change", function () {
@@ -1782,12 +1805,16 @@ import { sortPayments } from "./sort.js";
 
     var search = $("search");
     if (search) {
+      var searchTimer = null;
       search.addEventListener("input", function () {
-        store.update({ search: search.value.trim() });
-        store.clampActiveRow();
-        renderRows();
-        writeHash();
-        syncSearchClear();
+        window.clearTimeout(searchTimer);
+        searchTimer = window.setTimeout(function () {
+          store.update({ search: search.value.trim() });
+          store.clampActiveRow();
+          renderRows();
+          writeHash();
+          syncSearchClear();
+        }, FILTER_DEBOUNCE_MS);
       });
     }
 
@@ -1861,6 +1888,18 @@ import { sortPayments } from "./sort.js";
     }, 30000);
 
     restartAutoRefreshTimer();
+
+    /* Offline banner (#808): show it while the network is down, and refresh
+    once the connection returns so the list isn't left stale. */
+    function syncOnlineState() {
+      show($("offline-banner"), !navigator.onLine);
+    }
+    window.addEventListener("offline", syncOnlineState);
+    window.addEventListener("online", function () {
+      syncOnlineState();
+      if (store.get().key) { loadSummary(); reload(); }
+    });
+    syncOnlineState();
 
     initCreatePaymentDialog();
 

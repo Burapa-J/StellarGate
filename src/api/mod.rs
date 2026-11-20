@@ -220,6 +220,12 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/dashboard/keys.js", get(dashboard_keys_js))
         .route("/dashboard/vendor/qrcode.js", get(dashboard_qrcode_js))
         .route("/dashboard/theme.js", get(dashboard_theme_js))
+        /* Web app manifest and icons (#807). Static, data-free assets; no
+        service worker is registered, so API responses are never cached. */
+        .route("/dashboard/manifest.webmanifest", get(dashboard_manifest))
+        .route("/dashboard/icon.svg", get(dashboard_icon_svg))
+        .route("/dashboard/icon-192.png", get(dashboard_icon_192))
+        .route("/dashboard/icon-512.png", get(dashboard_icon_512))
         /* The versioned API surface, mounted twice.
         `/v1` is canonical. The same routes stay mounted unprefixed so every
         existing integrator keeps working — shipping versioning by breaking all
@@ -797,6 +803,31 @@ async fn revoke_api_key(
 #[derive(serde::Deserialize)]
 struct IssueKeyRequest {
     label: Option<String>,
+}
+
+async fn dashboard_manifest() -> impl IntoResponse {
+    dashboard_asset(
+        include_str!("../../static/manifest.webmanifest"),
+        "application/manifest+json",
+    )
+}
+
+async fn dashboard_icon_svg() -> impl IntoResponse {
+    dashboard_asset(include_str!("../../static/icon.svg"), "image/svg+xml")
+}
+
+async fn dashboard_icon_192() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, HeaderValue::from_static("image/png"))],
+        include_bytes!("../../static/icon-192.png").as_slice(),
+    )
+}
+
+async fn dashboard_icon_512() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, HeaderValue::from_static("image/png"))],
+        include_bytes!("../../static/icon-512.png").as_slice(),
+    )
 }
 
 async fn rate_limit_middleware(
