@@ -146,6 +146,8 @@ jobs:
       - name: Run and wait for healthy
         run: |
           docker run -d --name sg -p 3000:3000 \
+            --read-only --tmpfs /tmp \
+            --cap-drop ALL --security-opt no-new-privileges:true \
             -e STELLAR_GATEWAY_PUBLIC=UNCONFIGURED \
             -e WEBHOOK_SECRET=$(openssl rand -hex 32) \
             stellargate:ci
