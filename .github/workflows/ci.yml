@@ -104,7 +104,7 @@ jobs:
           node-version: 20
 
       - name: Check formatting
-        run: npx --yes prettier@3 --check "static/**/*.{html,css,js}"
+        run: npx --yes prettier@3.5.3 --check "static/**/*.{html,css,js}"
 
   deploy-consistency:
     name: deploy asset consistency
@@ -216,15 +216,9 @@ jobs:
           toolchain: stable
           components: llvm-tools-preview
 
-      - uses: actions/cache@v4
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-coverage-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-coverage-
+          shared-key: coverage
 
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov --locked
