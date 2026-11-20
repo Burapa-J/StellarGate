@@ -181,12 +181,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Compute image name and version
-        id: vars
-        run: |
-          set -euo pipefail
-          echo "image=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
-          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern=latest,enable=${{ !contains(github.ref_name, '-') }}
+            type=sha
 
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
@@ -206,9 +210,8 @@ jobs:
           push: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          tags: |
-            ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.version }}
-            ${{ steps.vars.outputs.image }}:${{ github.sha }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
 
       # GitHub-native, Sigstore-backed attestation over GitHub's OIDC identity
       # — no cosign key material to generate, store, or rotate. Verifiable
@@ -216,7 +219,7 @@ jobs:
       - name: Attest image provenance
         uses: actions/attest-build-provenance@v2
         with:
-          subject-name: ${{ steps.vars.outputs.image }}
+          subject-name: ghcr.io/${{ github.repository }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
 
