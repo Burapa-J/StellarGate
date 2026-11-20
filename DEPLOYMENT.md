@@ -36,3 +36,9 @@ other hosts. Use `BIND_ADDR=::` to listen on IPv6.
 Settings in a `.env` file are read at startup, including `RUST_LOG` and `PORT`
 (used by `stellargate healthcheck`). Variables already set in the process
 environment take precedence over `.env`.
+
+## Admin network restriction
+
+Set `ADMIN_ALLOWED_CIDRS` in `deploy/stellargate.env` (and export it for
+Caddy via compose) to limit `/dashboard/admin` and `/v1/merchants` to known
+source networks. See `deploy/Caddyfile` and `deploy/stellargate.env.example`.
