@@ -11,21 +11,95 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use std::sync::Arc;
+use stellargate::{
+    AppState, TaskHealth, api,
+    config::{AcceptedAsset, Config, ListenerMode},
+    db,
+    metrics::{
+        AuthMetrics, HorizonMetrics, HttpMetrics, PaymentMetrics, TrustlineMetrics, WebhookMetrics,
+    },
+};
 use tower::ServiceExt;
 
-/// Build the application router under test.
+/// Shared admin secret and metrics token, mirroring `tests/api_tests.rs`.
+const TEST_ADMIN_SECRET: &str = "test-admin-secret";
+const TEST_METRICS_TOKEN: &str = "test-metrics-token-32-chars-long";
+
+/// Build the application router under test, wired the same way the binary
+/// wires it, against a fresh shared-cache in-memory database.
 ///
 /// Kept in one place so the guard file stays black-box: tests only ever touch
 /// the public HTTP surface.
 async fn app() -> axum::Router {
-    // The router is constructed the same way the binary does it. If the
-    // constructor signature changes, only this helper needs updating.
-    crate::app_router_for_tests().await
+    let dsn = format!(
+        "sqlite:file:{}?mode=memory&cache=shared",
+        uuid::Uuid::new_v4()
+    );
+    let pool = db::open_pool(&dsn, 2, std::time::Duration::from_millis(5000))
+        .await
+        .expect("open test pool");
+    db::migrate(&pool).await.expect("migrate test pool");
+
+    let config = Config {
+        port: 0,
+        database_url: dsn,
+        network: "testnet".into(),
+        horizon_url: String::new(),
+        gateway_public: "UNCONFIGURED".into(),
+        accepted_assets: AcceptedAsset::default_list(),
+        webhook_secret: String::new(),
+        webhook_retry_attempts: 1,
+        webhook_retry_delay_ms: 0,
+        webhook_retry_max_delay_ms: 60_000,
+        allowed_webhook_schemes: vec!["https".into(), "http".into()],
+        webhook_timeout_secs: 10,
+        webhook_redrive_interval_secs: 30,
+        webhook_redrive_concurrency: 4,
+        webhook_redrive_max_attempts: 8,
+        webhook_redrive_grace_secs: 60,
+        webhook_redrive_backoff_initial_secs: 0,
+        webhook_redrive_backoff_max_secs: 0,
+        retention_interval_secs: 3600,
+        webhook_delivery_retention_days: 30,
+        idempotency_retention_days: 7,
+        poll_interval_secs: 10,
+        poll_max_pages_per_cycle: 50,
+        payment_ttl_secs: 3600,
+        rate_limit_requests_per_sec: 1000,
+        db_pool_max_connections: 2,
+        db_busy_timeout_ms: 5000,
+        cors_allowed_origins: vec![],
+        listener_mode: ListenerMode::Poll,
+        webhook_allow_private_targets: false,
+        admin_provisioning_secret: TEST_ADMIN_SECRET.into(),
+        metrics_token: TEST_METRICS_TOKEN.into(),
+        request_timeout_secs: 30,
+        stream_idle_timeout_secs: 30,
+        trusted_proxy_cidrs: vec![],
+    };
+
+    api::router(Arc::new(AppState {
+        pool,
+        config,
+        http: reqwest::Client::new(),
+        webhook_http: reqwest::Client::new(),
+        webhook_metrics: WebhookMetrics::new(),
+        auth_metrics: AuthMetrics::new(),
+        horizon_metrics: HorizonMetrics::new(),
+        trustline_metrics: TrustlineMetrics::new(),
+        http_metrics: HttpMetrics::new(),
+        payment_metrics: PaymentMetrics::new(),
+        task_health: TaskHealth::new(),
+    }))
 }
 
 /// Send a request through the router and return the response status.
 async fn status_of(router: axum::Router, request: Request<Body>) -> StatusCode {
-    let response = router.oneshot(request).await.expect("router call failed");
+    let response = router
+        .oneshot(request)
+        .await
+        .expect("router call failed");
     response.status()
 }
 

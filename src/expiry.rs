@@ -9,6 +9,7 @@
 //! Expiry is purely time- and database-driven, so the sweeper runs even when no
 //! Stellar gateway is configured (unlike the Horizon poller).
 
+use crate::supervise::TaskExit;
 use crate::{AppState, db, webhook};
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,12 +19,16 @@ use tracing::{debug, info, warn};
 /// The webhook event emitted when an intent is swept to `expired`.
 const EXPIRED_EVENT: &str = "payment.expired";
 
+/// Maximum intents expired per database round trip (issue #885). A backlog
+/// larger than this is drained over several batches within one sweep.
+const EXPIRY_BATCH_SIZE: i64 = 500;
+
 /// Run one sweep: expire overdue pending intents in bounded batches until a
 /// short batch comes back, firing each expired intent's webhook. Returns how
 /// many intents were expired. Safe to call repeatedly — an intent is
 /// transitioned at most once.
 pub async fn sweep_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
-    let batch_size = state.config.expiry_batch_size.max(1) as i64;
+    let batch_size = EXPIRY_BATCH_SIZE;
     let mut total = 0usize;
     loop {
         let expired = db::expire_overdue(&state.pool, batch_size).await?;
@@ -43,22 +48,29 @@ pub async fn sweep_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
 
 /// Background loop that sweeps expired intents on the configured poll interval
 /// until the process shuts down.
-pub async fn run_sweeper(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
-    let interval = Duration::from_secs(state.config.poll_interval_secs.max(1));
+///
+/// The first sweep runs immediately at startup, so intents that expired while
+/// the process was down are expired straight away rather than after a full
+/// interval. Later sweeps wait the configured interval.
+pub async fn run_sweeper(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) -> TaskExit {
+    let interval = Duration::from_secs(state.config.expiry_sweep_interval_secs.max(1));
     info!(
         ttl_secs = state.config.payment_ttl_secs,
-        interval_secs = state.config.poll_interval_secs,
+        interval_secs = state.config.expiry_sweep_interval_secs,
         "expiry sweeper started"
     );
 
+    // Zero for the first pass: sweep once right away, then wait the interval.
+    let mut wait = Duration::ZERO;
     loop {
         tokio::select! {
-            _ = tokio::time::sleep(interval) => {}
+            _ = tokio::time::sleep(wait) => {}
             _ = shutdown.changed() => {
                 info!("expiry sweeper shutting down");
-                return;
+                return TaskExit::ShutdownRequested;
             }
         }
+        wait = interval;
         match sweep_once(&state).await {
             Ok(0) => debug!("sweep: nothing to expire"),
             Ok(n) => info!(expired = n, "sweep expired payments"),
@@ -68,7 +80,7 @@ pub async fn run_sweeper(state: Arc<AppState>, mut shutdown: watch::Receiver<boo
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::{AcceptedAsset, Config, ListenerMode};
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -76,9 +88,10 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    fn test_config(webhook_url_allowed: bool) -> Config {
+    pub(crate) fn test_config(webhook_url_allowed: bool) -> Config {
         Config {
             port: 0,
+            bind_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             database_url: "sqlite::memory:".into(),
             network: "testnet".into(),
             horizon_url: String::new(),
@@ -100,6 +113,8 @@ mod tests {
             webhook_delivery_retention_days: 30,
             idempotency_retention_days: 7,
             poll_interval_secs: 10,
+            expiry_sweep_interval_secs: 10,
+            trustline_check_interval_secs: 3600,
             poll_max_pages_per_cycle: 50,
             payment_ttl_secs: 3600,
             rate_limit_requests_per_sec: 1000,
@@ -117,7 +132,7 @@ mod tests {
         }
     }
 
-    async fn memory_state(cfg: Config) -> AppState {
+    pub(crate) async fn memory_state(cfg: Config) -> AppState {
         let pool = SqlitePoolOptions::new()
             .connect_with(
                 SqliteConnectOptions::from_str(&cfg.database_url)
@@ -226,5 +241,54 @@ mod tests {
             ),
             "expiry webhook signature must verify against the received body"
         );
+    }
+
+    /// Issue #984: with a long poll interval, the first sweep must still run
+    /// at startup rather than after a full interval. An intent that expired
+    /// while the process was down is expired within seconds of boot.
+    #[tokio::test]
+    async fn sweeper_runs_its_first_pass_at_startup_without_waiting_an_interval() {
+        let mut cfg = test_config(true);
+        cfg.poll_interval_secs = 3600;
+        cfg.expiry_sweep_interval_secs = 3600;
+        let state = Arc::new(memory_state(cfg).await);
+        let payment = db::create_payment(
+            &state.pool,
+            db::NewPayment {
+                id: "pay_overdue_at_boot",
+                merchant_id: "merchant1",
+                destination_address: "GDESTINATION",
+                memo: "BOOTMEMO",
+                amount: "10",
+                asset: "XLM",
+                asset_issuer: None,
+                webhook_url: None,
+                ttl_secs: -10,
+            },
+        )
+        .await
+        .expect("overdue payment fixture should be created");
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sweeper = tokio::spawn(run_sweeper(state.clone(), shutdown_rx));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let current = db::get_payment(&state.pool, &payment.id)
+                .await
+                .unwrap()
+                .unwrap();
+            if current.status == "expired" {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the first sweep must run at startup, not after POLL_INTERVAL_SECS"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        shutdown_tx.send(true).unwrap();
+        sweeper.await.unwrap();
     }
 }

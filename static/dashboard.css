@@ -164,6 +164,23 @@ html[data-theme="dark"] {
   box-shadow: inset 0 0 0 2px var(--focus);
 }
 
+/* The Payment ID cell's button is the keyboard control for opening a payment
+   (#964). It looks like a link and keeps a visible focus ring. */
+.row-link {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--accent);
+  text-decoration: underline;
+  font: inherit;
+  cursor: pointer;
+}
+
+.row-link:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
 /* ── Forced colours (#822) ──────────────────────────────────────────────────
  *
  * Windows High Contrast and other `forced-colors` modes discard author colours
@@ -1546,3 +1563,20 @@ dialog::backdrop {
   #payment-invoice, #payment-invoice * { color: black !important; }
   #invoice-qr { break-inside: avoid; }
 }
+
+/* #781: briefly highlight rows that arrived in the latest refresh. */
+tr.row-new { background: color-mix(in srgb, var(--accent, #3b82f6) 18%, transparent); }
+@media (prefers-reduced-motion: no-preference) {
+  tr.row-new { animation: row-new-fade 4s ease-out; }
+}
+@keyframes row-new-fade {
+  from { background: color-mix(in srgb, var(--accent, #3b82f6) 35%, transparent); }
+}
+
+/* Detail drawer: timeline, shortfall, raw JSON, prev/next (#785-#788) */
+.timeline { list-style: none; margin: 0 0 1rem; padding-inline-start: 1rem; border-inline-start: 2px solid var(--border, #ccc); }
+.timeline li { position: relative; padding: 0.25rem 0 0.5rem 0.5rem; }
+.timeline li::before { content: ""; position: absolute; inset-inline-start: -1.4rem; top: 0.6rem; width: 0.6rem; height: 0.6rem; border-radius: 50%; background: currentColor; }
+.timeline li.timeline-failed { color: #b00020; font-weight: 600; }
+.raw-json pre { max-width: 100%; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+#detail-shortfall { margin-block-end: 1rem; }

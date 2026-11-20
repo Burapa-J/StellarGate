@@ -110,7 +110,6 @@ src/
     └── payments.rs  Payment and webhook-delivery handlers
 
 static/            Dashboard assets, compiled into the binary via include_str!
-migrations/        Versioned SQL, applied automatically on startup
 tests/             Integration tests (API, concurrency, rate limits, webhooks, trustlines)
 ```
 
@@ -202,6 +201,20 @@ deploy. Sign in with any merchant API key.
 | Webhook deliveries | Every attempt for a payment, with a one-click **Redeliver** |
 | Health | Live `/ready` indicator, polled every 30s |
 
+**Filters.** Status chips, an asset dropdown (filled from the assets your
+payments use), a date range and a search box combine freely. A **Clear
+filters** button appears only while a filter is active and resets the state,
+the URL hash and the inputs in one click. Changing a filter resets pagination.
+
+**Deep links.** `/dashboard#payment=<id>` opens that payment's detail drawer
+on load; the hash follows the drawer open/close, and an unknown id shows the
+drawer's error state. Only filters and payment ids go in the hash. The API key
+never appears in a URL.
+
+**Modules.** `dashboard.js` is the controller, `state.js` the view-state store
+and hash serialisation, `format.js` the pure formatting and query helpers,
+`dashboard-theme.js` the theme toggle. Screenshots: see the PR description.
+
 The detail panel is a modal `<dialog>`: opened with `showModal()`, so the rest
 of the page is inert rather than merely covered, and it is a keyboard trap
 while open — it takes focus when it opens, `Tab` and `Shift+Tab` cycle inside
@@ -262,11 +275,12 @@ All configuration is via environment variables, read once at startup. **Invalid 
 | Variable | Description | Default |
 |---|---|---|
 | `PORT` | HTTP listen port | `3000` |
+| `BIND_ADDR` | IP address the HTTP listener binds to. `127.0.0.1` keeps the API local-only (for example behind a reverse proxy on the same host); `::` listens on IPv6. An invalid value aborts boot. | `0.0.0.0` |
 | `DATABASE_URL` | sqlx connection string (not a file path) | `sqlite:stellargate.db` |
 | `STELLAR_NETWORK` | `testnet` or `public` | `testnet` |
-| `STELLAR_HORIZON_URL` | Horizon endpoint | testnet Horizon |
+| `STELLAR_HORIZON_URL` | Horizon endpoint. Defaults to match `STELLAR_NETWORK`: `https://horizon.stellar.org` on `public`, `https://horizon-testnet.stellar.org` otherwise. On `public`, a testnet Horizon URL aborts boot; on `testnet`, the mainnet Horizon logs a warning (issue #969). | per `STELLAR_NETWORK` (see description) |
 | `STELLAR_GATEWAY_PUBLIC` | Gateway wallet public key (`G…`), validated as a strkey at startup. The listener stays idle until this is set. | — |
-| `ACCEPTED_ASSETS` | Comma-separated. Only native XLM may be written as a bare `CODE`. Every other asset is `CODE:ISSUER` (`USDC:GA…`). A typo like `ACCEPTED_ASSETS=XLM,USDC` used to treat native XLM as settling USDC intents; boot now refuses it (issue #221). Duplicate codes are also refused (issue #222). Each issuer is strkey-validated. Adding an asset is config-only — but see [Trustlines](#trustlines). | `XLM,USDC:<testnet issuer>` |
+| `ACCEPTED_ASSETS` | Comma-separated. Only native XLM may be written as a bare `CODE`. Every other asset is `CODE:ISSUER` (`USDC:GA…`). A typo like `ACCEPTED_ASSETS=XLM,USDC` used to treat native XLM as settling USDC intents; boot now refuses it (issue #221). Duplicate codes are also refused (issue #222). Each issuer is strkey-validated. Adding an asset is config-only — but see [Trustlines](#trustlines). | `XLM,USDC:<testnet issuer>` on `testnet`; `XLM` only on `public` (the testnet USDC issuer is never accepted by default on mainnet — set `ACCEPTED_ASSETS` explicitly to accept a mainnet asset) |
 | `REQUEST_TIMEOUT_SECS` | Whole-request timeout; exceeding it returns `408` | `30` |
 | `MAX_PAYMENT_AMOUNT` | Maximum amount `POST /payments` accepts, in the asset's own units. A bare number (`100000`) applies to every asset; `CODE:AMOUNT` (`USDC:50000`) pins a bound to one asset specifically and always wins over the default; mix both with commas (`100000,USDC:50000`). Exceeding it returns `400 amount_out_of_range` naming the configured limit — distinct from `invalid_amount`, which means the value itself is malformed. Unset means no bound beyond `i64` overflow in `parse_stroops` (issue #310). | unset |
 | `MIN_PAYMENT_AMOUNT` | Minimum amount, configured the same way as `MAX_PAYMENT_AMOUNT`. Boot refuses a configuration where an asset's effective minimum exceeds its effective maximum. | unset |
@@ -297,10 +311,10 @@ first deploy.**
 **The check doesn't stop at boot.** A trustline can be removed at any time
 after startup — by the account operator, or by an issuer revoking
 authorization — and an asset can be added to `ACCEPTED_ASSETS` on a redeploy.
-A background `trustline_checker` task re-runs the same check on the retention
-worker's cadence (`RETENTION_INTERVAL_SECS`, default 1 hour) for as long as
-the gateway wallet is configured, so drift after boot is caught rather than
-only ever logged once.
+A background `trustline_checker` task re-runs the same check every
+`TRUSTLINE_CHECK_INTERVAL_SECS` (default 1 hour, independent of the retention
+worker) for as long as the gateway wallet is configured, so drift after boot is
+caught rather than only ever logged once.
 
 Current trustline state is on `GET /metrics`, so it's alertable rather than
 grep-only:
@@ -393,6 +407,7 @@ XLM free to cover one per asset.
 |---|---|---|
 | `STELLAR_LISTENER_MODE` | `stream` (SSE + poller reconciler) or `poll` (interval only) | `stream` |
 | `POLL_INTERVAL_SECS` | How often the poller reconciles | `10` |
+| `EXPIRY_SWEEP_INTERVAL_SECS` | How often the expiry sweeper transitions overdue `pending` intents to `expired`. Independent of `POLL_INTERVAL_SECS`; defaults to it, so existing deployments keep today's cadence. Must be `> 0`. | `POLL_INTERVAL_SECS` |
 | `CURSOR_STALENESS_MULTIPLE` | Multiplier on `POLL_INTERVAL_SECS` that may elapse without a successful poll/stream event before `/ready` reports the detection cursor stale (`503`). A healthy poller cycles on the poll interval, so this only trips when the poller died or the stream wedged. | `3` |
 | `POLL_MAX_PAGES_PER_CYCLE` | Maximum Horizon pages (200 records each) one poll cycle walks before yielding to the next tick. Bounds how long a catch-up can monopolise the poller; the cursor is checkpointed at every page boundary, so the next cycle resumes exactly where this one stopped. `0` = unlimited. | `50` |
 | `PAYMENT_TTL_SECS` | How long an intent stays `pending` before expiring, from `created_at` | `3600` |
@@ -445,7 +460,7 @@ skipped are logged at `info` on every first run.
 | Variable | Description | Default |
 |---|---|---|
 | `WEBHOOK_SECRET` | HMAC-SHA256 signing secret. Must be **≥ 32 characters**; known placeholder values are rejected at boot. | — |
-| `ALLOWED_WEBHOOK_SCHEMES` | Comma-separated URL schemes accepted for `webhook_url`. HTTPS is enforced on `public` regardless of this value. | `https` |
+| `ALLOWED_WEBHOOK_SCHEMES` | Comma-separated URL schemes accepted for `webhook_url`; only `http` and `https` are allowed, case-insensitively (`HTTPS` is fine). Any other scheme, or an empty list, aborts boot (issue #971). HTTPS is enforced on `public` regardless of this value. | `https` |
 | `WEBHOOK_RETRY_ATTEMPTS` | Inline delivery attempts | `3` |
 | `WEBHOOK_RETRY_DELAY_MS` | **Base** delay between inline retries — the first step of an exponential, jittered schedule, not a fixed interval | `5000` |
 | `WEBHOOK_RETRY_MAX_DELAY_MS` | Ceiling on one inline retry delay. Must be `≥` `WEBHOOK_RETRY_DELAY_MS`. | `60000` |
@@ -489,7 +504,7 @@ Recovers deliveries left `pending`/`failed` by a process that exited mid-send or
 |---|---|---|
 | `WEBHOOK_REDRIVE_INTERVAL_SECS` | Scan frequency | `30` |
 | `WEBHOOK_REDRIVE_CONCURRENCY` | Max redrive requests in flight | `4` |
-| `WEBHOOK_REDRIVE_MAX_ATTEMPTS` | Total attempts (inline + redrive) before a delivery is left permanently `failed` | `8` |
+| `WEBHOOK_REDRIVE_MAX_ATTEMPTS` | **Total** attempts (inline + redrive) before a delivery is left permanently `failed`. The count includes the `WEBHOOK_RETRY_ATTEMPTS` inline attempts, so it must be **greater than** `WEBHOOK_RETRY_ATTEMPTS` (validated at boot); at or below it, no inline-failed delivery is ever redriven. | `8` |
 | `WEBHOOK_REDRIVE_GRACE_SECS` | Idle time required before the worker touches a row, so it never races an in-flight inline delivery. Also the floor under the backoff. Must be `1..=86,400`. | `60` |
 | `WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS` | Exponential backoff base: `initial × 2^(attempts−1)`. A row never attempted is exempt and gated only by the grace window. Must be `0..=86,400`; `0` disables growth. | `30` |
 | `WEBHOOK_REDRIVE_BACKOFF_MAX_SECS` | Backoff ceiling. Must be `1..=86,400` and `≥` the initial value. | `900` |
@@ -514,6 +529,7 @@ down.
 | Variable | Description | Default |
 |---|---|---|
 | `RETENTION_INTERVAL_SECS` | How often the worker prunes | `3600` |
+| `TRUSTLINE_CHECK_INTERVAL_SECS` | How often the trustline checker re-verifies the gateway's trustlines for every accepted non-native asset. Must be `> 0`. | `3600` |
 | `WEBHOOK_DELIVERY_RETENTION_DAYS` | Days to keep **terminal** (`delivered`/`failed`) delivery rows. `0` keeps them forever. | `30` |
 | `IDEMPOTENCY_RETENTION_DAYS` | Days to keep idempotency keys — they only need to outlive the window in which a client might retry. `0` keeps them forever. | `7` |
 
@@ -532,7 +548,7 @@ until it finished; a backlog drains over several cycles instead.
 |---|---|---|
 | `ADMIN_PROVISIONING_SECRET` | Required via `X-Admin-Secret` to call `POST /merchants`. Unset disables provisioning entirely (always `401`). | _(unset — disabled)_ |
 | `METRICS_TOKEN` | Required via `Authorization: Bearer <token>` to call `GET /metrics`. Unset disables scraping entirely (always `401`) — the endpoint exposes auth outcome counters and webhook delivery volume, so it must not be reachable anonymously by default (issue #250). | _(unset — disabled)_ |
-| `CORS_ALLOWED_ORIGINS` | Comma-separated origins. **Required** on `public`; omitting on testnet falls back to permissive with a warning. | _(unset)_ |
+| `CORS_ALLOWED_ORIGINS` | Comma-separated origins, each in the browser `Origin` form `scheme://host[:port]` (e.g. `https://app.example.com`). A single trailing `/` is accepted. Paths, query strings, fragments, credentials, scheme-less hosts and `*` abort boot, naming the bad entry (issue #970). **Required** on `public`; omitting on testnet falls back to permissive with a warning. | _(unset)_ |
 | `RATE_LIMIT_REQUESTS_PER_SEC` | Base per-IP limit. Write routes get this rate; read-only routes get 5×. Must be `> 0` — boot fails otherwise; there is no "disabled" value. | `10` |
 | `TRUSTED_PROXY_CIDRS` | Comma-separated CIDR blocks whose `X-Forwarded-For`/`X-Real-IP` headers are honored for rate-limit bucketing and auth-log attribution. Every other peer is attributed by its own address and its headers are ignored — the safe default. | _(unset — headers ignored)_ |
 | `DB_POOL_MAX_CONNECTIONS` | SQLite pool size. WAL allows one writer plus many readers. | `10` |
@@ -1337,6 +1353,10 @@ The operator dashboard. Also serves `/dashboard/app.css` and
 
 Every on-chain payment matched by memo, destination, and asset resolves as follows:
 
+**Memo matching is case-insensitive and ignores surrounding whitespace.** A payer who types `ab12cd34` or ` AB12CD34 ` by hand settles intent `AB12CD34`. Intent memos are upper-case hex, so this normalisation cannot match two different intents.
+
+**Path payments are supported.** `path_payment_strict_send` and `path_payment_strict_receive` operations settle an intent when they deliver the intent's asset and amount to its destination with the right memo. The amount compared is what the destination received, so a payer who converts on the way is credited in the asset the merchant asked for. A path payment that delivers a different asset is rejected.
+
 | Scenario | `status` | Event | `delta` |
 |---|---|---|---|
 | Paid exactly | `completed` | `payment.completed` | — |
@@ -1345,6 +1365,8 @@ Every on-chain payment matched by memo, destination, and asset resolves as follo
 | Top-up reaching exactly the total | `completed` | `payment.completed` | — |
 | Top-up exceeding the total | `completed` | `payment.overpaid` | cumulative excess |
 | TTL elapsed, unpaid | `expired` | `payment.expired` | — |
+| Paid **on time**, but the TTL passed before the sweeper ran | as paid (`completed`, or `underpaid` for a partial payment) | as paid | as paid |
+| Paid **after** the TTL, before the sweeper ran | unchanged (`pending`/`underpaid`); the sweeper then sets `expired` | `payment.unexpected` (then `payment.expired` on the sweep) | unexpected amount to refund |
 | Payment after `completed` or `expired` | unchanged | `payment.unexpected` | unexpected amount to refund |
 
 **Overpayment** fulfils the intent. The `delta` field carries the excess; refunding it is the merchant's responsibility — the gateway cannot send funds.

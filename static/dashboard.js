@@ -25,7 +25,9 @@ import {
   countdown as _countdown,
   CSV_COLUMNS,
   explorerTx as _explorerTx,
-  fmtTime,
+  fmtTime as _fmtTime,
+  formatAmountLocale,
+  newPaymentIds,
   formatAmount as _formatAmount,
   pillClass,
   relativeTime as _relativeTime,
@@ -84,6 +86,22 @@ import { sortPayments } from "./sort.js";
     if (node) node.hidden = !visible;
   }
 
+  /* The one markup sink (#799). With `require-trusted-types-for 'script'` a
+     plain string assigned to innerHTML throws, so the vendored QR encoder's
+     output goes through a named policy. API fields never reach this path. */
+  var qrPolicy = null;
+  function setTrustedSvg(node, markup) {
+    if (!node) return;
+    clear(node);
+    if (!markup) return;
+    if (window.trustedTypes && !qrPolicy) {
+      qrPolicy = window.trustedTypes.createPolicy("stellargate-qr", {
+        createHTML: function (s) { return s; },
+      });
+    }
+    node.innerHTML = qrPolicy ? qrPolicy.createHTML(markup) : markup;
+  }
+
   function clear(node) {
     if (!node) return;
     while (node.firstChild) node.removeChild(node.firstChild);
@@ -112,7 +130,17 @@ import { sortPayments } from "./sort.js";
   // helper is defined (the test checks for `function name(` in this file).
 
   /** Format a payment amount with its asset code. @see format.js */
-  function formatAmount(amount, asset) { return _formatAmount(amount, asset); }
+  function formatAmount(amount, asset) {
+    return formatAmountLocale(amount, asset, document.documentElement.lang || undefined);
+  }
+
+  /** Active display zone: "local" or "utc" (#783). */
+  function activeZone() {
+    return prefs.get().timezone === "utc" ? "utc" : "local";
+  }
+
+  /** Timestamp in the active zone, zone name included. @see format.js */
+  function fmtTime(iso) { return _fmtTime(iso, activeZone()); }
 
   /** Coarse countdown to an ISO instant. @see format.js */
   function countdown(iso, now) { return _countdown(iso, now); }
@@ -134,9 +162,24 @@ import { sortPayments } from "./sort.js";
     });
   }
 
+  /** Read the payment id from a "#payment=<id>" deep link (#780). */
+  function hashPaymentId() {
+    try {
+      return new URLSearchParams(window.location.hash.slice(1)).get("payment") || "";
+    } catch (e) {
+      return "";
+    }
+  }
+
   function writeHashState() {
     try {
       var hash = serializeHash(store.get());
+      var sel = store.get().selectedPaymentId;
+      if (sel) {
+        var qp = new URLSearchParams(hash);
+        qp.set("payment", sel);
+        hash = qp.toString();
+      }
       var base = window.location.pathname;
       var url = base + (hash ? "#" + hash : "");
       window.history.replaceState(null, "", url);
@@ -272,7 +315,7 @@ import { sortPayments } from "./sort.js";
     if (interval) interval.value = String(p.refreshIntervalSec);
     var theme = $("prefs-theme");
     if (theme) theme.value = p.theme || "system";
-    var tz = $("prefs-timezone");
+    var tz = $("prefs-timezone") || $("settings-timezone");
     if (tz) tz.value = p.timezone || "local";
     syncColumnMenuUi();
   }
@@ -426,7 +469,7 @@ import { sortPayments } from "./sort.js";
       });
     }
 
-    var tz = $("prefs-timezone");
+    var tz = $("prefs-timezone") || $("settings-timezone");
     if (tz) {
       tz.addEventListener("change", function () {
         prefs.update({ timezone: tz.value });
@@ -490,16 +533,135 @@ import { sortPayments } from "./sort.js";
   // ── Session ───────────────────────────────────────────────────────────────
 
   function showGate(message) {
-    store.update({ key: null, selectedPaymentId: null, activeRow: -1 });
+    store.update({
+      key: null,
+      selectedPaymentId: null,
+      activeRow: -1,
+      loadedPayments: [],
+      cursor: null,
+      loading: false,
+    });
     closeDetail();
+    wipePaymentData();
     show($("app"), false);
     show($("gate"), true);
     setError($("gate-error"), message || null);
   }
 
-  function signOut(message) {
+  /** Empty every container that can hold payment data (#797). Hidden is not
+   *  gone: a hidden table, summary or drawer would still be in the DOM. */
+  function wipePaymentData() {
+    ["rows", "summary", "detail-fields", "deliveries", "invoice-fields",
+      "invoice-qr", "instr-qr"].forEach(function (id) { clear($(id)); });
+    ["invoice-uri", "instr-qr-alt", "instr-destination", "instr-memo",
+      "instr-amount", "instr-asset", "instr-expiry", "instr-id", "rows-status",
+      "deliveries-error"].forEach(function (id) {
+      var n = $(id);
+      if (n) n.textContent = "";
+    });
+    show($("payment-invoice"), false);
+    clearListState();
+    currentDetailPayment = null;
+    watchedPayments = {};
+    if (autoRefreshTimer !== null) {
+      window.clearInterval(autoRefreshTimer);
+      autoRefreshTimer = null;
+    }
+  }
+
+  // ── Cross-tab sign-out (#795) ─────────────────────────────────────────────
+  // Only a signal is broadcast — never the key itself.
+  var SIGNOUT_SIGNAL = "stellargate.signout";
+  var signoutChannel = null;
+  try {
+    if (typeof BroadcastChannel === "function") {
+      signoutChannel = new BroadcastChannel(SIGNOUT_SIGNAL);
+      signoutChannel.onmessage = function () { localSignOut(null); };
+    }
+  } catch (e) { signoutChannel = null; }
+
+  window.addEventListener("storage", function (ev) {
+    if (ev.key === SIGNOUT_SIGNAL && ev.newValue) localSignOut(null);
+  });
+
+  function broadcastSignOut() {
+    if (signoutChannel) {
+      try { signoutChannel.postMessage("signout"); return; } catch (e) { /* fall through */ }
+    }
+    try {
+      window.localStorage.setItem(SIGNOUT_SIGNAL, String(Date.now()));
+      window.localStorage.removeItem(SIGNOUT_SIGNAL);
+    } catch (e) { /* non-fatal */ }
+  }
+
+  function localSignOut(message) {
+    stopIdleWatch();
     session.clear();
+    store.update({ loadedPayments: [] });
+    clear($("rows"));
+    clear($("summary"));
     showGate(message);
+  }
+
+  function signOut(message) {
+    localSignOut(message);
+    broadcastSignOut();
+  }
+
+  // ── Idle sign-out (#794) ──────────────────────────────────────────────────
+  var IDLE_MS = 30 * 60 * 1000;
+  var IDLE_WARN_MS = 60 * 1000;
+  var idleTimer = null;
+  var idleWarnTimer = null;
+  var idleListening = false;
+
+  function idleMs() {
+    var n = Number(prefs.get().idleMinutes);
+    return isFinite(n) && n > 0 ? n * 60 * 1000 : IDLE_MS;
+  }
+
+  function hideIdleWarning() {
+    var w = $("idle-warning");
+    if (w) show(w, false);
+  }
+
+  function resetIdleTimer() {
+    window.clearTimeout(idleTimer);
+    window.clearTimeout(idleWarnTimer);
+    hideIdleWarning();
+    if (!store.get().key) return;
+    var total = idleMs();
+    idleWarnTimer = window.setTimeout(function () {
+      var w = $("idle-warning");
+      if (w) show(w, true);
+    }, Math.max(0, total - IDLE_WARN_MS));
+    idleTimer = window.setTimeout(function () { signOut("Signed out after a period of inactivity."); }, total);
+  }
+
+  function onActivity(ev) {
+    if (ev && ev.type === "visibilitychange" && document.hidden) return;
+    // Once the warning is up, only the explicit button extends the session.
+    var w = $("idle-warning");
+    if (w && !w.hidden) return;
+    resetIdleTimer();
+  }
+
+  function startIdleWatch() {
+    if (!idleListening) {
+      idleListening = true;
+      ["keydown", "pointerdown", "pointermove", "visibilitychange"].forEach(function (name) {
+        (name === "visibilitychange" ? document : window).addEventListener(name, onActivity, { passive: true });
+      });
+      var stay = $("idle-stay");
+      if (stay) stay.addEventListener("click", resetIdleTimer);
+    }
+    resetIdleTimer();
+  }
+
+  function stopIdleWatch() {
+    window.clearTimeout(idleTimer);
+    window.clearTimeout(idleWarnTimer);
+    hideIdleWarning();
   }
 
   function signIn(key, persist) {
@@ -511,11 +673,15 @@ import { sortPayments } from "./sort.js";
       show($("app"), true);
       setError($("gate-error"), null);
       updateSessionExpiry();
+      startIdleWatch();
       loadVersion();
       loadNetworkBadge();
       pollHealth();
       loadSummary();
+      syncFilterUi();
       reload();
+      var linked = hashPaymentId();
+      if (linked) openDetail(linked);
     });
   }
 
@@ -584,19 +750,16 @@ import { sortPayments } from "./sort.js";
     var intervalMs = (prefs.get().refreshIntervalSec || 30) * 1000;
     autoRefreshTimer = window.setInterval(function () {
       var stateSnap = store.get();
-      if (navigator.onLine && stateSnap.key && stateSnap.autoRefresh && (!stateSnap.status || stateSnap.status === "pending")) {
+      if (document.hidden) return; // #803: no polling from background tabs
+      if (stateSnap.key && stateSnap.autoRefresh && (!stateSnap.status || stateSnap.status === "pending")) {
         reload();
       }
     }, intervalMs);
   }
 
   function reload() {
-    if (listAbort) {
-      listAbort.abort();
-      listAbort = null;
-      store.update({ loading: false });
-      reloadPending = false;
-    }
+    /* Everything shown (or seen) before this refresh is "old". */
+    seenIds = Object.assign({}, seenIds || {}, seenAccum);
     store.resetPaging();
     store.update({ loadedPayments: [] });
     clear($("rows"));
@@ -627,9 +790,12 @@ import { sortPayments } from "./sort.js";
         if (stamp) stamp.textContent = "Last updated " + fmtTime(new Date().toISOString());
         var payments = body.payments || [];
         notifyWatchedPayments(payments);
+        markNewRows(payments, isFirstPage);
         var rows = store.get().loadedPayments.concat(payments);
         store.update({ loadedPayments: rows });
+        collectAssets(payments);
         renderRows();
+        renderAssetTotals();
 
         var more = payments.length === store.get().pageSize && !!body.next_cursor;
         store.update({ cursor: more ? body.next_cursor : null });
@@ -668,6 +834,28 @@ import { sortPayments } from "./sort.js";
       });
   }
 
+  // Completed totals per asset for the active date range (#793). The summary
+  // endpoint only returns status counts, so this sums the loaded payments; the
+  // list request already carries the date range filter.
+  function renderAssetTotals() {
+    var box = $("asset-totals");
+    if (!box) return;
+    clear(box);
+    var totals = {};
+    store.get().loadedPayments.forEach(function (p) {
+      if (p.status !== "completed") return;
+      var n = Number(p.paid_amount || p.amount);
+      if (!isFinite(n)) return;
+      totals[p.asset] = (totals[p.asset] || 0) + n;
+    });
+    Object.keys(totals).sort().forEach(function (asset) {
+      var card = el("div", "summary-card");
+      card.appendChild(el("span", "muted small", "Received " + asset));
+      card.appendChild(el("strong", null, formatAmount(totals[asset], asset)));
+      box.appendChild(card);
+    });
+  }
+
   function loadSummary() {
     api("/payments/summary")
       .then(function (body) {
@@ -686,8 +874,30 @@ import { sortPayments } from "./sort.js";
       });
   }
 
+  // ── New-since-refresh highlight (#781) ────────────────────────────────────
+  var seenIds = null;     // ids known before the current refresh; null on first load
+  var newIds = {};
+  var seenAccum = {};
+
+  /** Record this page's ids; flag ones unseen before the refresh and announce the count. */
+  function markNewRows(payments, isFirstPage) {
+    var fresh = seenIds && isFirstPage ? newPaymentIds(seenIds, payments) : [];
+    fresh.forEach(function (id) { newIds[id] = true; });
+    payments.forEach(function (p) { seenAccum[p.id] = true; });
+    if (fresh.length) {
+      announce(fresh.length + (fresh.length === 1 ? " new payment" : " new payments"));
+      window.setTimeout(function () {
+        fresh.forEach(function (id) { delete newIds[id]; });
+        Array.prototype.forEach.call(document.querySelectorAll("tr.row-new"), function (tr) {
+          tr.classList.remove("row-new");
+        });
+      }, 4000);
+    }
+  }
+
   function renderRows() {
     var tbody = $("rows");
+    updatePaymentsCaption();
     var visible = sortedVisiblePayments();
     var active = store.get().activeRow;
     clear(tbody);
@@ -887,8 +1097,10 @@ import { sortPayments } from "./sort.js";
 
   function rowFor(p, isActive) {
     var tr = document.createElement("tr");
-    tr.tabIndex = 0;
+    // Rows are not tab stops (#964): keyboard users reach a payment through
+    // the button in the Payment ID cell, which is the primary control.
     tr.dataset.paymentId = p.id;
+    if (newIds[p.id]) tr.classList.add("row-new");
     if (isActive) {
       tr.className = "row-active";
       tr.setAttribute("aria-current", "true");
@@ -947,14 +1159,18 @@ import { sortPayments } from "./sort.js";
     if (!isColumnVisible("created")) createdCell.hidden = true;
     tr.appendChild(createdCell);
 
-    var idCell = labelledCell("Payment ID", "mono", shortId(p.id));
+    /* The button is the accessible control (#964). Its click bubbles to the
+       row listener below, which is the mouse convenience on top of it. */
+    var idCell = document.createElement("td");
+    idCell.setAttribute("data-label", "Payment ID");
     idCell.setAttribute("data-column", "id");
+    var openButton = el("button", "row-link mono", shortId(p.id));
+    openButton.type = "button";
+    openButton.setAttribute("aria-label", "View payment " + p.id);
+    idCell.appendChild(openButton);
     tr.appendChild(idCell);
 
-    tr.addEventListener("click", function () { openDetail(p.id, tr); });
-    tr.addEventListener("keydown", function (ev) {
-      if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); openDetail(p.id, tr); }
-    });
+    tr.addEventListener("click", function () { openDetail(p.id, openButton); });
     return tr;
   }
 
@@ -990,6 +1206,7 @@ import { sortPayments } from "./sort.js";
    */
   function openDetail(id, trigger) {
     store.update({ selectedPaymentId: id });
+    writeHashState();
     state.detailTrigger = trigger || null;
 
     var detail = $("detail");
@@ -1007,6 +1224,11 @@ import { sortPayments } from "./sort.js";
     clear($("invoice-fields")); clear($("invoice-qr"));
     $("invoice-uri").textContent = "";
     show($("detail-notify"), false);
+    clear($("detail-timeline"));
+    $("detail-shortfall").hidden = true;
+    $("detail-raw-body").textContent = "";
+    writeHash();
+    updateDrawerNav();
     showDetailSkeleton();
     openModal(detail);
     focusDetail();
@@ -1017,6 +1239,9 @@ import { sortPayments } from "./sort.js";
         renderInvoice(p);
         currentDetailPayment = p;
         syncNotifyButton(p);
+        renderShortfall(p);
+        renderRawJson(p);
+        renderTimeline(p, null);
         clear(fields);
         [
           [t("field.status"), p.status, true],
@@ -1066,6 +1291,83 @@ import { sortPayments } from "./sort.js";
     loadDeliveries(id);
   }
 
+  /** Parse a decimal string into integer stroops (7 dp) with BigInt; null if invalid. */
+  function toStroops(v) {
+    var m = /^(\d+)(?:\.(\d{1,7})\d*)?$/.exec(String(v == null ? "" : v).trim());
+    if (!m) return null;
+    return BigInt(m[1]) * 10000000n + BigInt(((m[2] || "") + "0000000").slice(0, 7));
+  }
+
+  function fromStroops(n) {
+    var s = n.toString().padStart(8, "0");
+    return (s.slice(0, -7) + "." + s.slice(-7)).replace(/\.?0+$/, "");
+  }
+
+  function renderShortfall(p) {
+    var box = $("detail-shortfall");
+    var fields = $("shortfall-fields");
+    clear(fields);
+    var expected = toStroops(p.amount);
+    var received = toStroops(p.paid_amount || "0");
+    if (p.status !== "underpaid" || expected === null || received === null) {
+      box.hidden = true;
+      return;
+    }
+    var missing = expected > received ? expected - received : 0n;
+    [
+      ["Expected", fromStroops(expected) + " " + p.asset],
+      ["Received", fromStroops(received) + " " + p.asset],
+      ["Shortfall", fromStroops(missing) + " " + p.asset],
+    ].forEach(function (pair) {
+      fields.appendChild(el("dt", null, pair[0]));
+      fields.appendChild(el("dd", "mono", pair[1]));
+    });
+    box.hidden = false;
+  }
+
+  function renderRawJson(p) {
+    $("detail-raw-body").textContent = JSON.stringify(p, null, 2);
+  }
+
+  /** Vertical lifecycle timeline from payment + delivery timestamps. */
+  function renderTimeline(p, deliveries) {
+    var list = $("detail-timeline");
+    clear(list);
+    var steps = [["Created", p.created_at]];
+    if (p.paid_amount || p.tx_hash) steps.push(["Payment seen", p.updated_at]);
+    if (p.status === "completed") steps.push(["Completed", p.updated_at]);
+    else if (p.status === "underpaid") steps.push(["Underpaid", p.updated_at]);
+    else if (p.status === "expired") steps.push(["Expired", p.expires_at]);
+    steps.forEach(function (s) {
+      list.appendChild(el("li", null, s[0] + " \u00b7 " + fmtTime(s[1])));
+    });
+    (deliveries || []).forEach(function (d) {
+      var failed = d.status === "failed";
+      var li = el("li", failed ? "timeline-failed" : null,
+        (failed ? "\u2716 Webhook failed" : "Webhook " + (d.status || "queued")) +
+        " (" + (d.event || "webhook") + ") \u00b7 " + fmtTime(d.last_attempt || d.created_at));
+      list.appendChild(li);
+    });
+  }
+
+  /** Move the drawer to the previous/next payment in the loaded, filtered list. */
+  function stepDetail(delta) {
+    var id = store.get().selectedPaymentId;
+    var rows = sortedVisiblePayments();
+    var i = rows.findIndex(function (r) { return r.id === id; });
+    var next = rows[i + delta];
+    if (i < 0 || !next) return;
+    openDetail(next.id, state.detailTrigger);
+  }
+
+  function updateDrawerNav() {
+    var id = store.get().selectedPaymentId;
+    var rows = sortedVisiblePayments();
+    var i = rows.findIndex(function (r) { return r.id === id; });
+    $("detail-prev").disabled = i <= 0;
+    $("detail-next").disabled = i < 0 || i >= rows.length - 1;
+  }
+
   function renderInvoice(payment) {
     var fields = $("invoice-fields");
     clear(fields);
@@ -1085,7 +1387,7 @@ import { sortPayments } from "./sort.js";
     clear($("invoice-qr"));
     if (typeof QRCode !== "undefined" && QRCode.toSvg) {
       // Only the vendored encoder's SVG is markup; API fields remain text.
-      $("invoice-qr").innerHTML = QRCode.toSvg(uri, { size: 220, margin: 4 }) || "";
+      setTrustedSvg($("invoice-qr"), QRCode.toSvg(uri, { size: 220, margin: 4 }));
     }
     $("payment-invoice").hidden = false;
     $("invoice-print").disabled = false;
@@ -1142,6 +1444,7 @@ import { sortPayments } from "./sort.js";
    */
   function onDetailClosed() {
     store.update({ selectedPaymentId: null });
+    writeHash();
     var detail = $("detail");
     if (detail) detail.classList.remove("detail-open");
     var trigger = state.detailTrigger;
@@ -1193,6 +1496,9 @@ import { sortPayments } from "./sort.js";
         var list = $("deliveries");
         clear(list);
         var deliveries = body.deliveries || [];
+        if (currentDetailPayment && currentDetailPayment.id === paymentId) {
+          renderTimeline(currentDetailPayment, deliveries);
+        }
         show($("deliveries-empty"), deliveries.length === 0);
         if (deliveries.length > 0) {
           deliveries.forEach(function (d) { list.appendChild(deliveryItem(paymentId, d)); });
@@ -1326,7 +1632,7 @@ import { sortPayments } from "./sort.js";
         if (svgMarkup) {
           /* We only set innerHTML on a div we own and control; the content
              comes from our own QR encoder, not from the API or user input. */
-          qrContainer.innerHTML = svgMarkup;
+          setTrustedSvg(qrContainer, svgMarkup);
         }
       }
       /* Text alternative always present (#763). */
@@ -1486,7 +1792,7 @@ import { sortPayments } from "./sort.js";
   // ── Export ────────────────────────────────────────────────────────────────
 
   function exportCsv(payments, filename) {
-    var csv = toCsv(payments, CSV_COLUMNS);
+    var csv = toCsv(payments, CSV_COLUMNS, activeZone());
     var blob = new Blob([csv], { type: "text/csv" });
     var url = URL.createObjectURL(blob);
     var a = document.createElement("a");
@@ -1594,6 +1900,65 @@ import { sortPayments } from "./sort.js";
 
   // ── Filter / search UI ────────────────────────────────────────────────────
 
+  /**
+   * Keep the payments table caption in step with the active filters (#964).
+   * Screen-reader users hear the caption when they enter the table, so it
+   * must say what the rows currently represent.
+   */
+  function updatePaymentsCaption() {
+    var node = $("payments-caption");
+    if (!node) return;
+    var state = store.get();
+    var text = "Payments: " + (state.status || "all") + " statuses";
+    if (state.search) text += ', matching "' + state.search + '"';
+    node.textContent = text;
+  }
+
+  /** Add asset codes from `payments` to the dropdown's known set (#689). */
+  function collectAssets(payments) {
+    var known = store.get().knownAssets.slice();
+    var changed = false;
+    payments.forEach(function (p) {
+      var a = p.asset || "XLM";
+      if (known.indexOf(a) < 0) { known.push(a); changed = true; }
+    });
+    if (!changed) return;
+    known.sort();
+    store.update({ knownAssets: known });
+    syncAssetOptions();
+  }
+
+  function syncAssetOptions() {
+    var sel = $("asset-filter");
+    if (!sel) return;
+    var st = store.get();
+    var codes = st.knownAssets.slice();
+    if (st.asset && codes.indexOf(st.asset) < 0) codes.push(st.asset);
+    clear(sel);
+    var all = document.createElement("option");
+    all.value = "";
+    all.textContent = "All assets";
+    sel.appendChild(all);
+    codes.forEach(function (c) {
+      var o = document.createElement("option");
+      o.value = c;
+      o.textContent = c;
+      sel.appendChild(o);
+    });
+    sel.value = st.asset;
+  }
+
+  function hasActiveFilters() {
+    var s = store.get();
+    return !!(s.status || s.asset || s.search || s.createdAfter || s.createdBefore);
+  }
+
+  /** Reset every filter, the hash and the inputs, then reload (#779). */
+  function clearFilters() {
+    store.update({ status: "", asset: "", search: "", createdAfter: "", createdBefore: "" });
+    onFilterChange();
+  }
+
   function syncFilterUi() {
     var state = store.get();
     Array.prototype.forEach.call(document.querySelectorAll(".chip"), function (chip) {
@@ -1612,6 +1977,8 @@ import { sortPayments } from "./sort.js";
     var size = $("page-size");
     if (size) size.value = String(state.pageSize);
 
+    updatePaymentsCaption();
+
     var after = $("created-after");
     if (after && after.value !== state.createdAfter) after.value = state.createdAfter;
 
@@ -1621,6 +1988,14 @@ import { sortPayments } from "./sort.js";
     var auto = $("auto-refresh");
     if (auto) auto.checked = state.autoRefresh;
 
+    syncAssetOptions();
+    var clr = $("clear-filters");
+    if (clr) clr.hidden = !hasActiveFilters();
+    syncSearchClear();
+    var minA = $("min-amount");
+    if (minA && minA.value !== state.minAmount) minA.value = state.minAmount;
+    var maxA = $("max-amount");
+    if (maxA && maxA.value !== state.maxAmount) maxA.value = state.maxAmount;
     syncPresetUi();
   }
 
@@ -1680,10 +2055,11 @@ import { sortPayments } from "./sort.js";
       return;
     }
     ev.preventDefault();
+    var drawerOpen = $("detail") && $("detail").open;
     switch (action) {
       case "refresh":    reload(); break;
-      case "nextRow":    moveActiveRow(1); break;
-      case "prevRow":    moveActiveRow(-1); break;
+      case "nextRow":    if (drawerOpen) stepDetail(1); else moveActiveRow(1); break;
+      case "prevRow":    if (drawerOpen) stepDetail(-1); else moveActiveRow(-1); break;
       case "closeDrawer": closeDetail(); break;
       case "toggleHelp": toggleHelp(); break;
     }
@@ -1740,6 +2116,9 @@ import { sortPayments } from "./sort.js";
       ev.preventDefault();
       var key = $("api-key").value.trim();
       if (!key) return;
+      $("api-key").type = "password";
+      $("api-key-toggle").setAttribute("aria-pressed", "false");
+      $("api-key-toggle").textContent = "Show";
       setError($("gate-error"), null);
       signIn(key, $("remember").checked).catch(function (err) {
         if (err.message !== "unauthorized") setError($("gate-error"), err.message);
@@ -1747,6 +2126,17 @@ import { sortPayments } from "./sort.js";
     });
 
     $("sign-out").addEventListener("click", function () { signOut(null); });
+
+    var keyToggle = $("api-key-toggle");
+    if (keyToggle) {
+      keyToggle.addEventListener("click", function () {
+        var input = $("api-key");
+        var reveal = input.type === "password";
+        input.type = reveal ? "text" : "password";
+        keyToggle.setAttribute("aria-pressed", reveal ? "true" : "false");
+        keyToggle.textContent = reveal ? "Hide" : "Show";
+      });
+    }
 
     var versionReload = $("version-reload");
     if (versionReload) {
@@ -1818,6 +2208,18 @@ import { sortPayments } from "./sort.js";
       });
     }
 
+    ["min-amount", "max-amount"].forEach(function (id) {
+      var input = $(id);
+      if (!input) return;
+      input.addEventListener("input", function () {
+        store.update({ minAmount: $("min-amount").value.trim(), maxAmount: $("max-amount").value.trim() });
+        store.clampActiveRow();
+        renderRows();
+        var note = $("amount-filter-note");
+        if (note) note.hidden = !(store.get().minAmount || store.get().maxAmount);
+      });
+    });
+
     $("load-more").addEventListener("click", function () {
       store.update({ activeRow: -1 });
       loadPayments();
@@ -1848,6 +2250,15 @@ import { sortPayments } from "./sort.js";
         });
       }
       $("detail-close").addEventListener("click", closeDetail);
+      $("detail-prev").addEventListener("click", function () { stepDetail(-1); });
+      $("detail-next").addEventListener("click", function () { stepDetail(1); });
+      $("detail-raw-copy").addEventListener("click", function () {
+        var btn = $("detail-raw-copy");
+        navigator.clipboard.writeText($("detail-raw-body").textContent).then(function () {
+          btn.textContent = "Copied";
+          window.setTimeout(function () { btn.textContent = "Copy"; }, 1500);
+        }).catch(function () {});
+      });
       $("detail").addEventListener("click", dismissOnBackdrop);
       $("detail").addEventListener("keydown", trapDetailFocus);
       $("detail").addEventListener("close", onDetailClosed);
@@ -1879,13 +2290,29 @@ import { sortPayments } from "./sort.js";
       });
     });
 
+    $("asset-filter").addEventListener("change", function () {
+      store.update({ asset: $("asset-filter").value });
+      onFilterChange();
+    });
+
+    $("clear-filters").addEventListener("click", clearFilters);
+
     window.addEventListener("hashchange", function () {
       if (store.get().key) { applyHash(); reload(); }
     });
 
     window.setInterval(function () {
+      if (document.hidden) return; // #803: pause health polling while hidden
       if (store.get().key) { pollHealth(); checkDeployedVersion(); }
     }, 30000);
+
+    // #803: refresh once as soon as the tab becomes visible again.
+    document.addEventListener("visibilitychange", function () {
+      if (document.hidden || !store.get().key) return;
+      pollHealth();
+      var snap = store.get();
+      if (snap.autoRefresh && (!snap.status || snap.status === "pending")) reload();
+    });
 
     restartAutoRefreshTimer();
 
