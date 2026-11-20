@@ -37,7 +37,8 @@ services:
     expose:
       - "3000"
     env_file:
-      - ./stellargate.env
+      - path: ./stellargate.env
+        required: true
     environment:
       DATABASE_URL: sqlite:///data/stellargate.db
       PORT: "3000"
@@ -80,8 +81,9 @@ services:
       - "80:80"
       - "443:443"
       - "443:443/udp" # HTTP/3
-    env_file:
-      - ./stellargate.env
+    environment:
+      DOMAIN: ${DOMAIN:?Set DOMAIN in deploy/stellargate.env}
+      ACME_EMAIL: ${ACME_EMAIL:?Set ACME_EMAIL in deploy/stellargate.env}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data # ACME account + issued certificates — must persist

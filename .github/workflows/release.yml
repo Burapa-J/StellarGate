@@ -206,6 +206,9 @@ jobs:
           push: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          build-args: |
+            VERSION=${{ steps.vars.outputs.version }}
+            VCS_REF=${{ github.sha }}
           tags: |
             ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.version }}
             ${{ steps.vars.outputs.image }}:${{ github.sha }}

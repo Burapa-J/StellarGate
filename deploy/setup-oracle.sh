@@ -146,7 +146,9 @@ cat <<EOF
 
     3. sudo systemctl start stellargate
 
-    4. curl https://<your-domain>/health
+    4. curl -fsS https://<your-domain>/ -o /dev/null
+       # Or probe readiness inside the stack (edge blocks /health publicly):
+       # docker compose --env-file deploy/stellargate.env -f deploy/docker-compose.prod.yml exec -T app stellargate healthcheck ready
 
   Logs:    docker compose --env-file deploy/stellargate.env -f deploy/docker-compose.prod.yml logs -f
   Status:  systemctl status stellargate
