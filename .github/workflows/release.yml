@@ -45,8 +45,40 @@ permissions:
   contents: read
 
 jobs:
+  version-check:
+    name: verify tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+      - name: Compare tag to crate version
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          crate_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          if [ "$tag_version" != "$crate_version" ]; then
+            echo "Tag v${tag_version} does not match Cargo.toml version ${crate_version}" >&2
+            exit 1
+          fi
+
+  test:
+    name: test release candidate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+          components: clippy
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --all-features --workspace
+
   binaries:
     name: binary (${{ matrix.target }})
+    needs: [version-check, test]
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -172,7 +204,7 @@ jobs:
 
   image:
     name: container image
-    needs: [docker-smoke]
+    needs: [version-check, test, docker-smoke]
     runs-on: ubuntu-latest
     permissions:
       packages: write
