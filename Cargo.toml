@@ -40,7 +40,7 @@ sha2 = "0.11"
 hex = "0.4"
 dotenvy = "0.15"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 anyhow = "1"
 time = { version = "0.3", features = ["parsing"] }
 # API key generation. Uses the OS CSPRNG — a UUIDv4 is random but only carries
