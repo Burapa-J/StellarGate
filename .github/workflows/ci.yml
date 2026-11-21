@@ -110,7 +110,7 @@ jobs:
           node-version: 20
 
       - name: Check formatting
-        run: npx --yes prettier@3 --check "static/**/*.{html,css,js}"
+        run: npx --yes prettier@3.5.3 --check "static/**/*.{html,css,js}"
 
   test-count:
     name: regression test count

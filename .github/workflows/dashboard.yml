@@ -13,6 +13,7 @@ on:
       - "e2e/**"
       - "src/**"
       - "scripts/check-dashboard-a11y.mjs"
+      - "scripts/check-dashboard-contrast.mjs"
       - ".prettierrc.json"
       - ".prettierignore"
       - "Cargo.toml"
@@ -26,6 +27,7 @@ on:
       - "e2e/**"
       - "src/**"
       - "scripts/check-dashboard-a11y.mjs"
+      - "scripts/check-dashboard-contrast.mjs"
       - ".prettierrc.json"
       - ".prettierignore"
       - "Cargo.toml"
@@ -103,6 +105,9 @@ jobs:
 
       - name: Accessibility smoke check
         run: node scripts/check-dashboard-a11y.mjs
+
+      - name: Dashboard colour contrast check
+        run: node scripts/check-dashboard-contrast.mjs
 
   # The dashboard's logic lives in DOM-free ES modules precisely so it can be
   # tested with Node's built-in runner — no npm dependencies, no package.json,
@@ -199,15 +204,9 @@ jobs:
         with:
           toolchain: "1.94"
 
-      - uses: actions/cache@v4
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-e2e-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-e2e-
+          shared-key: dashboard-e2e
 
       - name: Set up Node
         uses: actions/setup-node@v4
