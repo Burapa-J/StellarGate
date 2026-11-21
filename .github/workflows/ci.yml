@@ -112,6 +112,21 @@ jobs:
       - name: Check formatting
         run: npx --yes prettier@3 --check "static/**/*.{html,css,js}"
 
+  test-count:
+    name: regression test count
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fetch base branch
+        run: git fetch origin "${{ github.base_ref }}"
+      - name: Check test count
+        env:
+          TEST_REMOVAL_APPROVED: ${{ contains(github.event.pull_request.labels.*.name, 'test-removal-approved') && 'true' || 'false' }}
+        run: bash scripts/check-test-count.sh "origin/${{ github.base_ref }}"
+
   deploy-consistency:
     name: deploy asset consistency
     runs-on: ubuntu-latest
