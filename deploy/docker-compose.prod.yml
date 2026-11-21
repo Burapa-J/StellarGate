@@ -18,6 +18,13 @@ services:
   app:
     image: ghcr.io/stellargatelabs/stellargate:${STELLARGATE_VERSION:?Set STELLARGATE_VERSION in deploy/stellargate.env to a released tag, e.g. v1.2.3 — see https://github.com/StellarGateLabs/StellarGate/releases}
     restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     # Compose's own default (10s) is shorter than the app's own
     # SHUTDOWN_GRACE_SECS drain budget (default 30s) — see "Shutdown grace"
     # in DEPLOYMENT.md. Raised here so the app is never SIGKILLed mid-drain.
@@ -66,6 +73,12 @@ services:
   caddy:
     image: caddy:2.8.4-alpine@sha256:af32e97399febea808609119bb21544d0265c58a02836576e32a2d082c262c17
     restart: unless-stopped
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
     depends_on:
       - app
     # A TLS-terminating reverse proxy in front of one backend needs far less
