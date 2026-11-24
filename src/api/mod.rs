@@ -1382,7 +1382,10 @@ fn dashboard_asset(body: &'static str, content_type: &'static str, req: &HeaderM
 }
 
 async fn network_info(State(state): State<Arc<AppState>>) -> Json<Value> {
-    Json(json!({ "network": state.config.network }))
+    Json(json!({
+        "network": state.config.network,
+        "network_passphrase": crate::config::network_passphrase(&state.config.network),
+    }))
 }
 
 async fn dashboard_i18n(headers: HeaderMap) -> Response {
