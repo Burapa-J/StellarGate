@@ -280,6 +280,7 @@ fn dashboard_routes() -> axum::Router<Arc<AppState>> {
         disk, so nothing under static/ is exposed by accident. */
         .route("/dashboard/session.js", get(dashboard_session_js))
         .route("/dashboard/state.js", get(dashboard_state_js))
+        .route("/dashboard/prefs.js", get(dashboard_prefs_js))
         .route("/dashboard/keys.js", get(dashboard_keys_js))
         .route("/dashboard/vendor/qrcode.js", get(dashboard_qrcode_js))
         .route("/dashboard/theme.js", get(dashboard_theme_js))
@@ -1323,6 +1324,7 @@ const DASHBOARD_JS: &str = include_str!("../../static/dashboard.js");
 const DASHBOARD_FORMAT_JS: &str = include_str!("../../static/format.js");
 const DASHBOARD_SESSION_JS: &str = include_str!("../../static/session.js");
 const DASHBOARD_STATE_JS: &str = include_str!("../../static/state.js");
+const DASHBOARD_PREFS_JS: &str = include_str!("../../static/prefs.js");
 const DASHBOARD_KEYS_JS: &str = include_str!("../../static/keys.js");
 const DASHBOARD_QRCODE_JS: &str = include_str!("../../static/vendor/qrcode.js");
 const DASHBOARD_FAVICON: &str = include_str!("../../static/favicon.svg");
@@ -1416,6 +1418,14 @@ async fn dashboard_format_js(headers: HeaderMap) -> Response {
 async fn dashboard_session_js(headers: HeaderMap) -> Response {
     dashboard_asset(
         DASHBOARD_SESSION_JS,
+        "text/javascript; charset=utf-8",
+        &headers,
+    )
+}
+
+async fn dashboard_prefs_js(headers: HeaderMap) -> Response {
+    dashboard_asset(
+        DASHBOARD_PREFS_JS,
         "text/javascript; charset=utf-8",
         &headers,
     )

@@ -105,6 +105,7 @@ const MODULES: &[(&str, &str)] = &[
         include_str!("../static/session.js"),
     ),
     ("/dashboard/state.js", include_str!("../static/state.js")),
+    ("/dashboard/prefs.js", include_str!("../static/prefs.js")),
     ("/dashboard/keys.js", include_str!("../static/keys.js")),
 ];
 
@@ -117,6 +118,7 @@ const JS_ROUTES: &[&str] = &[
     "/dashboard/format.js",
     "/dashboard/session.js",
     "/dashboard/state.js",
+    "/dashboard/prefs.js",
     "/dashboard/keys.js",
     "/dashboard/vendor/qrcode.js",
 ];
