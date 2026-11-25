@@ -851,17 +851,26 @@ fn theme_is_applied_before_first_paint() {
 /// operator never asked for, and stop a later OS change from showing up.
 #[test]
 fn theme_override_is_tri_state_and_persisted() {
+    // The settings panel (#771) owns persistence: the theme goes through
+    // state.js savePrefs under PREFS_NAMESPACE + "theme", and the pre-paint
+    // bootstrap has to read that same key or the stored choice never applies
+    // before first paint.
     assert!(
-        DASHBOARD_JS.contains(r#"var THEME_KEY = "stellargate.theme";"#),
+        DASHBOARD_STATE_JS.contains(r#"export const PREFS_NAMESPACE = "stellargate.prefs.";"#)
+            && DASHBOARD_STATE_JS.contains(r#"writeKey(store, "theme", normalized.theme);"#),
         "the preference must be stored under a stable key"
     );
     assert!(
-        DASHBOARD_JS.contains("window.localStorage.setItem(THEME_KEY, theme);"),
+        DASHBOARD_THEME_JS.contains(r#"var KEY = "stellargate.prefs.theme";"#),
+        "the bootstrap must read the key the settings panel writes"
+    );
+    assert!(
+        DASHBOARD_JS.contains("prefs.update({ theme: theme });"),
         "choosing a theme must persist it"
     );
     assert!(
-        DASHBOARD_JS.contains("window.localStorage.removeItem(THEME_KEY);"),
-        "clearing the override must remove it, not store a resolved value"
+        DASHBOARD_JS.contains(r#"prefs.update({ theme: "system" });"#),
+        "clearing the override must store \"system\", not a resolved value"
     );
     assert!(
         DASHBOARD_JS.contains(r#"document.documentElement.removeAttribute("data-theme")"#),
